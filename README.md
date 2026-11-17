@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 95 tools, root and environment hiding included, structured errors.
+used for mobile game automation and app testing. 97 tools, root and environment hiding included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -301,6 +301,8 @@ For the case where something on the guest actively looks for emulator or root tr
 |---|---|
 | `mumu_stealth_scan` | enumerate the leak surface and grade every item; changes nothing |
 | `mumu_stealth_hide` | close the reversible part, re-scan, report what is left |
+| `mumu_stealth_deep` | bind-mount over the files a professional check reads |
+| `mumu_stealth_deep_restore` | unmount every override and delete the staged fakes |
 
 Every finding is graded **`clean` / `leak` / `unfixable`**, and the headline `verdict` keys on the
 unfixable ones — one structural tell is enough for an integrity check to fail, whatever else got
@@ -338,6 +340,50 @@ Two behaviours worth knowing, both found by testing rather than reading:
 The honest summary: properties and adbd privilege close completely; the kernel-level and
 HAL-level tells do not, and the scan says so up front instead of promising a clean verdict it
 cannot deliver.
+
+### Deep layer — the files a real check opens
+
+`mumu_stealth_hide` fixes what `getprop` exposes. A professional check does not stop there: it opens
+specific files. Those are read-only, but **`mount --bind` changes what a read returns**, and unlike a
+kernel hook a bind mount leaves no code patch to find. `mumu_stealth_deep` uses that.
+
+| file | before | after |
+|---|---|---|
+| `/proc/cpuinfo` | `vendor_id: AuthenticAMD` under `uname -m = aarch64` | 8-core ARM profile (`CPU implementer: 0x41`, Cortex-X4/A720/A520) |
+| `/sys/class/dmi/id/*` | `innotek GmbH` / `NiohBox` — **VirtualBox** | Samsung SM-S9210 (8 fields) |
+| `/proc/kallsyms` | 840 `__x64_sys_*` entries | ARM symbol stub |
+| `clocksource` | `kvm-clock` | `arch_sys_counter` |
+| `/proc/sys/kernel/osrelease` | `6.1.90-perf+` | `6.1.75-android14-…` |
+
+The fake profile is deliberately consistent with the property layer — `ro.product.model=SM-S9210`,
+`ro.product.cpu.abilist` ARM, and a cpuinfo claiming `e1q` cores. A fake that contradicts another
+property is a *new* tell, worse than the one it replaced.
+
+Verified from the detector's side: reading those paths as the plain `shell` user (no root env) returns
+the fake values. `mumu_stealth_deep_restore` unmounts all 14 and deletes the staged files; a reboot
+also clears them.
+
+**What this still cannot close** — stated in the tool result, not left for you to discover:
+
+| tell | why |
+|---|---|
+| `uname(2)` → `uname -r` still `6.1.90-perf+` | a syscall, not a file. Closing it needs an `LD_PRELOAD` shim (per-process — useless against a game with its own loader) or a kernel hook, which is a stronger signal than the leak |
+| `sensor_count: 1` | `sensorservice` reports it; needs a faked sensors HAL, which this image does not ship |
+| SELinux `Permissive` | `setenforce 1` hangs the image and takes adbd offline (measured) |
+| `/data/adb/ksu` | KernelSU needs it; a half-move is a new inconsistency |
+| `hypervisor` CPU flag | gone once `cpuinfo` is overridden — the flag lives in that file |
+
+So the sequence that actually gets you furthest:
+
+```python
+mumu_root_adb(enabled=True)
+mumu_stealth_hide()          # properties + adbd privilege
+mumu_stealth_deep()          # cpuinfo, dmi, kallsyms, clocksource, osrelease
+mumu_root_adb(enabled=False) # drop adbd last, or it re-exposes root
+```
+
+After that, the remaining surface is the sensor count, SELinux's mode, and `uname -r`. Those three are
+not closable on this image, and no amount of property work changes that.
 
 ### Kernel input channel
 
@@ -412,8 +458,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 129 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 140
+.venv\Scripts\python -m pytest -q                       # hermetic: 147 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 159
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -429,7 +475,8 @@ mumu_mcp/
   device.py      foreground, launch, battery, proxy, hosts, processes
   flow.py        scripted step lists, locator resolution, failure reporting
   gesture.py     kernel input channel, MT-protocol-B frames, raw batching
-  stealth.py     environment surface scan, property/root hiding, grading
+  stealth.py     environment surface scan, property/root hiding, grading, bind-mount layer
+  fakeprofile.py the ARM/DMI/clocksource content the deep layer installs
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

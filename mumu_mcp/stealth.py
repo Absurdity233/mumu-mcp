@@ -159,7 +159,73 @@ class Stealth:
         scan.findings.append(self._rootfs_finding(vmindex))
         scan.findings.append(self._debug_finding(vmindex))
         scan.findings.append(self._selinux_finding(vmindex))
+        scan.findings.append(self._dmi_finding(vmindex))
+        scan.findings.append(self._cpuinfo_finding(vmindex))
+        scan.findings.append(self._clocksource_finding(vmindex))
+        scan.findings.append(self._blockdev_finding(vmindex))
         return scan
+
+    def _dmi_finding(self, vmindex: int) -> Finding:
+        """DMI is the strongest VM tell on this image: `innotek GmbH` is VirtualBox."""
+        from . import fakeprofile as fp
+
+        values = {}
+        for key in ("sys_vendor", "product_name", "bios_vendor", "board_vendor"):
+            out = self._sh(vmindex, f"cat {fp.DMI_DIR}/{key} 2>/dev/null").strip()
+            if out:
+                values[key] = out
+        bad = {k: v for k, v in values.items()
+               if any(m in v.lower() for m in ("innotek", "vbox", "virtualbox", "qemu", "vmware"))}
+        covered = self._verify_fakes(vmindex).get("dmi_sys_vendor", {}).get("covered", False)
+        if covered and not bad:
+            return Finding("dmi", "overridden", "clean")
+        return Finding(
+            name="dmi", value=f"{len(bad)} VM-vendor fields" if bad else "suspicious",
+            status="leak",
+            detail="; ".join(f"{k}={v}" for k, v in bad.items()) or str(values)[:80],
+            fix="mumu_stealth_deep(cpuinfo/dmi) — bind-mounts a handset DMI over the sysfs file",
+        )
+
+    def _cpuinfo_finding(self, vmindex: int) -> Finding:
+        """`vendor_id : AuthenticAMD` under `uname -m = aarch64` cannot both be true."""
+        from . import fakeprofile as fp
+
+        real = self._sh(vmindex, f"head -20 {fp.OVERRIDES['cpuinfo']} 2>&1")
+        covered = "CPU implementer" in real and "AuthenticAMD" not in real
+        if covered:
+            return Finding("cpuinfo", "ARM profile", "clean")
+        x86 = "AuthenticAMD" in real or "vendor_id" in real
+        return Finding(
+            name="cpuinfo", value="x86 on aarch64" if x86 else "unknown",
+            status="leak" if x86 else "clean",
+            detail="vendor_id: AuthenticAMD while uname -m says aarch64" if x86 else "",
+            fix="mumu_stealth_deep(cpuinfo=True)" if x86 else "",
+        )
+
+    def _clocksource_finding(self, vmindex: int) -> Finding:
+        """`kvm-clock` names the hypervisor; no handset has it."""
+        from . import fakeprofile as fp
+
+        current = self._sh(vmindex, f"cat {fp.OVERRIDES['clocksource_current']} 2>/dev/null").strip()
+        available = self._sh(vmindex, f"cat {fp.OVERRIDES['clocksource_available']} 2>/dev/null").strip()
+        leak = "kvm" in current.lower() or "kvm" in available.lower()
+        return Finding(
+            name="clocksource", value=current or "unknown",
+            status="leak" if leak else "clean",
+            detail=f"available: {available}" if leak else "",
+            fix="mumu_stealth_deep(clocksource=True)" if leak else "",
+        )
+
+    def _blockdev_finding(self, vmindex: int) -> Finding:
+        """VirtIO `vda`/`vdb` is a hard tell; SATA `sd*` is merely unusual on a phone."""
+        out = self._sh(vmindex, "ls /dev/block/ 2>/dev/null | grep -E '^vd|^nvme' | head -4")
+        virtio = [x for x in out.split() if x]
+        return Finding(
+            name="block_devices", value="virtio" if virtio else "sd/ufs",
+            status="unfixable" if virtio else "clean",
+            detail=", ".join(virtio) if virtio else "no virtio/nvme device names",
+            fix="" if not virtio else "device naming comes from the kernel driver set; not a file",
+        )
 
     def _collect_props(self, vmindex: int) -> dict[str, str]:
         out = self._sh(vmindex, "getprop", timeout=40)
@@ -225,23 +291,38 @@ class Stealth:
         )
 
     def _kernel_finding(self, vmindex: int) -> Finding:
-        uname = self._sh(vmindex, "uname -m").strip()
+        """Report *which* kernel tell is still open, not a single aggregate verdict.
+
+        After the bind-mount layer the cpuinfo and kallsyms halves can be clean
+        while `uname -r` still names the real kernel, so an all-or-nothing
+        "inconsistent" hides how much is left.
+        """
+        uname_m = self._sh(vmindex, "uname -m").strip()
+        uname_r = self._sh(vmindex, "uname -r").strip()
         cpu = self._sh(vmindex, "grep -m1 'vendor_id\\|CPU implementer' /proc/cpuinfo").strip()
         hypervisor = "hypervisor" in self._sh(vmindex, "grep -m1 '^flags' /proc/cpuinfo")
         kallsyms = "x64_sys" in self._sh(vmindex, "grep -m1 init_module /proc/kallsyms 2>/dev/null")
-        inconsistent = (
-            (uname == "aarch64" and "AuthenticAMD" in cpu)
-            or hypervisor
-            or (uname == "aarch64" and kallsyms)
-        )
-        detail = f"uname={uname}, cpu={cpu.split(':')[-1].strip() or cpu}, hypervisor={hypervisor}"
+
+        open_tells: list[str] = []
+        if "AuthenticAMD" in cpu or "vendor_id" in cpu:
+            open_tells.append("cpuinfo says x86")
+        if hypervisor:
+            open_tells.append("cpuinfo has the hypervisor flag")
+        if kallsyms:
+            open_tells.append("kallsyms exposes __x64_sys_*")
+        if "perf+" in uname_r or "android" not in uname_r.lower():
+            open_tells.append(f"uname -r is {uname_r!r} (a handset reports -android)")
+
+        detail = f"uname={uname_m}/{uname_r}"
+        if not open_tells:
+            return Finding("kernel_consistency", "consistent", "clean", detail=detail)
         return Finding(
-            name="kernel_consistency", value="inconsistent" if inconsistent else "ok",
-            status="unfixable" if inconsistent else "clean",
-            detail=detail,
-            fix="" if not inconsistent else
-                "uname/cpuinfo/kallsyms disagree; closing this needs a uname+kallsyms hook, "
-                "which is itself detectable",
+            name="kernel_consistency",
+            value=f"{len(open_tells)} open tell(s)",
+            status="unfixable",
+            detail="; ".join(open_tells),
+            fix="uname(2) is a syscall; the cpuinfo/kallsyms halves close via mumu_stealth_deep, "
+                "the uname half needs an LD_PRELOAD shim or a kernel hook",
         )
 
     def _modules_finding(self, vmindex: int) -> Finding:
@@ -305,6 +386,133 @@ class Stealth:
             detail="Permissive is a strong rooting signal",
             fix="cannot be closed at runtime: setenforce hangs this image and takes adbd offline",
         )
+
+    # -- deep hide: bind-mount over the fake-heavy files ------------------
+    def deep_hide(self, vmindex: int = 0, *, cpuinfo: bool = True, dmi: bool = True,
+                  clocksource: bool = True, osrelease: bool = True,
+                  kallsyms: bool = True) -> dict[str, Any]:
+        """Cover the files a professional check opens, using bind mounts.
+
+        Measured on this image: `/sys/class/dmi/id/*` and `/proc/cpuinfo` are not
+        writable, but `mount --bind <fake> <target>` **does** change what a read
+        returns. That is the only mechanism that fixes the DMI and cpuinfo leaks
+        without a kernel hook — and unlike a hook, a bind mount leaves no code
+        patch to detect.
+
+        What this cannot do, and the caller is told so: `uname(2)` is a syscall,
+        not a file, so `uname -m` still says what the kernel says. Covering it
+        needs an LD_PRELOAD shim (per-process, useless for a game that has its own
+        loader) or a kernel hook (a stronger signal than the leak itself).
+
+        Everything here is runtime state: a reboot removes the mounts.
+        """
+        state = self.root.state(vmindex)
+        if not state.is_root:
+            raise BadArgument("bind-mount overrides need root", detail={"fix": "mumu_root_adb(True)"})
+        if not state.system_writable and (cpuinfo or dmi):
+            # /data/local/tmp is writable either way; /system is not involved.
+            pass
+
+        from . import fakeprofile as fp
+
+        stage = fp.STAGE_DIR
+        self._sh(vmindex, f"mkdir -p {stage}/dmi", timeout=20)
+        applied: dict[str, Any] = {"staged": stage}
+
+        if cpuinfo:
+            applied["cpuinfo"] = self._bind(
+                vmindex, f"{stage}/cpuinfo", fp.OVERRIDES["cpuinfo"], fp.cpuinfo())
+        if osrelease:
+            applied["osrelease"] = self._bind(
+                vmindex, f"{stage}/osrelease", fp.OVERRIDES["osrelease"], fp.OSRELEASE + "\n")
+        if clocksource:
+            applied["clocksource"] = {
+                "available": self._bind(
+                    vmindex, f"{stage}/cs_avail", fp.OVERRIDES["clocksource_available"],
+                    fp.CLOCKSOURCE_AVAILABLE),
+                "current": self._bind(
+                    vmindex, f"{stage}/cs_cur", fp.OVERRIDES["clocksource_current"],
+                    fp.CLOCKSOURCE_CURRENT + "\n"),
+            }
+        if kallsyms:
+            raw = self._sh(vmindex, "grep -c 'x64_sys' /proc/kallsyms 2>/dev/null").strip()
+            # `grep -c` prints a number, but a shell that failed prints anything;
+            # never let an unparsable value take the whole hide down.
+            try:
+                x64 = int(raw)
+            except ValueError:
+                x64 = 0
+            if x64 > 0:
+                applied["kallsyms"] = self._bind(
+                    vmindex, f"{stage}/kallsyms", fp.OVERRIDES["kallsyms"], fp.KALLSYMS)
+                applied["kallsyms"]["replaced_x64_sysymbols"] = x64
+        if dmi:
+            dmi_results = {}
+            for key, value in fp.DMI.items():
+                target = f"{fp.DMI_DIR}/{key}"
+                exists = "No such" not in self._sh(vmindex, f"ls {target} 2>&1")
+                if not exists:
+                    continue
+                dmi_results[key] = self._bind(vmindex, f"{stage}/dmi/{key}", target, value + "\n")
+            applied["dmi"] = dmi_results
+
+        applied["uname"] = {
+            "covered": False,
+            "note": "uname(2) is a syscall, not a file; bind-mounting /proc/version does not change it",
+            "still_reports": self._sh(vmindex, "uname -m").strip(),
+        }
+        return applied
+
+    def _bind(self, vmindex: int, staged: str, target: str, content: str) -> dict[str, Any]:
+        """Write `content` to `staged`, then bind-mount it over `target`.
+
+        A bind mount over an existing mount needs the fake to be a real file on a
+        writable fs first, so it is staged under /data/local/tmp. `--bind` on a
+        single file works on this kernel; `--rbind` would hide a whole directory and
+        break tools that enumerate it.
+        """
+        # Write via base64 to keep newlines and tabs intact through the shell.
+        import base64
+        blob = base64.b64encode(content.encode()).decode()
+        self._sh(vmindex, f"echo {blob} | base64 -d > {staged} 2>&1", timeout=20)
+        self._sh(vmindex, f"umount {target} 2>/dev/null; mount --bind {staged} {target} 2>&1",
+                 timeout=20)
+        after = self._sh(vmindex, f"head -c 200 {target} 2>&1").strip()
+        return {"target": target, "ok": after.startswith(content.strip()[:20]),
+                "read_back": after.splitlines()[0] if after else ""}
+
+    def deep_restore(self, vmindex: int = 0) -> dict[str, Any]:
+        """Unmount every override and remove the staged fakes."""
+        from . import fakeprofile as fp
+
+        targets = list(fp.OVERRIDES.values())
+        targets += [f"{fp.DMI_DIR}/{k}" for k in fp.DMI]
+        unmounted = []
+        for target in targets:
+            out = self._sh(vmindex, f"umount {target} 2>&1").strip()
+            if "not mounted" not in out.lower() and "No such" not in out:
+                unmounted.append(target)
+        self._sh(vmindex, f"rm -rf {fp.STAGE_DIR}", timeout=20)
+        return {"unmounted": unmounted, "staged_removed": fp.STAGE_DIR}
+
+    def _verify_fakes(self, vmindex: int) -> dict[str, Any]:
+        """Read each faked file back and say which ones are actually covered."""
+        from . import fakeprofile as fp
+
+        checks = {
+            "cpuinfo": (fp.OVERRIDES["cpuinfo"], "CPU implementer"),
+            "osrelease": (fp.OVERRIDES["osrelease"], fp.OSRELEASE[:10]),
+            "clocksource": (fp.OVERRIDES["clocksource_current"], fp.CLOCKSOURCE_CURRENT),
+            "dmi_sys_vendor": (f"{fp.DMI_DIR}/sys_vendor", fp.DMI["sys_vendor"]),
+        }
+        out: dict[str, Any] = {}
+        for name, (path, needle) in checks.items():
+            value = self._sh(vmindex, f"head -c 300 {path} 2>&1").strip()
+            out[name] = {"covered": needle in value, "value": value[:80]}
+        # kallsyms is checked by absence: the x86 symbols must be gone.
+        x64 = self._sh(vmindex, "grep -c 'x64_sys' /proc/kallsyms 2>/dev/null").strip()
+        out["kallsyms"] = {"covered": x64 in {"0", ""}, "x64_symbols": x64}
+        return out
 
     # -- hide --------------------------------------------------------------
     def hide(self, vmindex: int = 0, *, properties: bool = True, root: bool = True,

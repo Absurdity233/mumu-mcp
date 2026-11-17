@@ -126,16 +126,32 @@ def test_sensor_count_clean_when_plausible():
     assert s._sensors_finding(0).status == "clean"
 
 
-def test_kernel_inconsistency_detected_from_hypervisor_flag():
+def test_kernel_inconsistency_lists_each_open_tell():
+    """The finding must name *which* tell is open, not aggregate them into one word."""
     s, _ = _stealth({
         "uname -m": "aarch64",
+        "uname -r": "6.1.90-perf+",
         "grep -m1 'vendor_id\\|CPU implementer' /proc/cpuinfo": "vendor_id : AuthenticAMD",
         "grep -m1 '^flags' /proc/cpuinfo": "flags : fpu hypervisor avx2",
         "grep -m1 init_module /proc/kallsyms 2>/dev/null": "ffffffff T __x64_sys_init_module",
     })
     finding = s._kernel_finding(0)
     assert finding.status == "unfixable"
-    assert "hypervisor=True" in finding.detail
+    assert "hypervisor flag" in finding.detail
+    assert "cpuinfo says x86" in finding.detail
+    assert "uname -r" in finding.detail
+
+
+def test_kernel_clean_when_cpuinfo_and_kallsyms_covered():
+    """After the bind-mount layer, only uname -r should remain open."""
+    s, _ = _stealth({
+        "uname -m": "aarch64",
+        "uname -r": "6.1.75-android14-11-g4d9e0d1b2c3f",
+        "grep -m1 'vendor_id\\|CPU implementer' /proc/cpuinfo": "CPU implementer : 0x41",
+        "grep -m1 '^flags' /proc/cpuinfo": "",
+        "grep -m1 init_module /proc/kallsyms 2>/dev/null": "",
+    })
+    assert s._kernel_finding(0).status == "clean"
 
 
 def test_selinux_permissive_is_unfixable_not_a_leak():

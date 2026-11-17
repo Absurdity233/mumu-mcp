@@ -1606,6 +1606,47 @@ def mumu_stealth_hide(vmindex: int = 0, properties: bool = True, root_hide: bool
     return stealth().hide(vmindex, properties=properties, root=root_hide, restore=restore)
 
 
+@mcp.tool()
+@_wrap
+def mumu_stealth_deep(vmindex: int = 0, cpuinfo: bool = True, dmi: bool = True,
+                      clocksource: bool = True, osrelease: bool = True) -> dict:
+    """Cover the files a professional integrity check opens, with bind mounts.
+
+    This is the layer above `mumu_stealth_hide`. Properties are visible to a
+    `getprop`; these files are what a check reads directly when it wants to know
+    whether it is on real hardware:
+
+    | file | real value here | after |
+    |---|---|---|
+    | `/proc/cpuinfo` | `vendor_id: AuthenticAMD` under `uname -m = aarch64` | 8-core ARM profile |
+    | `/sys/class/dmi/id/*` | `innotek GmbH` / `NiohBox` (**VirtualBox**) | Samsung SM-S9210 |
+    | `clocksource` | `kvm-clock` | `arch_sys_counter` |
+    | `/proc/sys/kernel/osrelease` | `6.1.90-perf+` | a plausible Samsung 6.1 build |
+
+    `mount --bind` is what makes this work: those paths are read-only, but a bind
+    mount changes what a read returns, and unlike a kernel hook it leaves no code
+    patch to find.
+
+    What it cannot do: `uname(2)` is a syscall, not a file. `uname -m` still
+    reports the truth, and closing that needs an LD_PRELOAD shim (per-process,
+    useless against a game's own loader) or a kernel hook (a stronger signal than
+    the leak). The result says so under `uname`.
+
+    Runtime-only: a reboot removes the mounts. `mumu_stealth_deep_restore` does it
+    without a reboot.
+    """
+    return {"applied": stealth().deep_hide(vmindex, cpuinfo=cpuinfo, dmi=dmi,
+                                           clocksource=clocksource, osrelease=osrelease),
+            "verified": stealth()._verify_fakes(vmindex)}
+
+
+@mcp.tool()
+@_wrap
+def mumu_stealth_deep_restore(vmindex: int = 0) -> dict:
+    """Unmount every override installed by `mumu_stealth_deep` and delete the staged files."""
+    return stealth().deep_restore(vmindex)
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
