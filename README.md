@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 74 tools, root included, structured errors.
+used for mobile game automation and app testing. 87 tools, root included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -224,6 +224,75 @@ brittle; the dump hands you `"center": [720, 1600]` for the node whose `text` is
 SELinux is `Permissive` on MuMu's image, so policy denials are not the obstacle they
 would be on a stock device.
 
+### Device state
+
+| tool | purpose |
+|---|---|
+| `mumu_snapshot` | foreground app, screen, battery, adbd uid, proxy, storage — one call, one moment |
+| `mumu_foreground` | which package/activity is in front |
+| `mumu_wait_activity` | block until the foreground package (or regex) matches |
+| `mumu_launch` | `am start` with `-W`, returns `total_ms` and cold/warm |
+| `mumu_battery` · `mumu_set_battery` | read, override, or `reset` the reported battery |
+| `mumu_proxy` · `mumu_set_proxy` | the global HTTP proxy apps actually read |
+| `mumu_hosts` · `mumu_add_hosts` | pin DNS by editing `/system/etc/hosts` through the root overlay |
+| `mumu_storage` · `mumu_processes` | free space; top processes with load average |
+
+`mumu_snapshot` exists because five separate calls are both slower and internally
+inconsistent: the foreground app and the screen size should describe the same moment. If one
+probe fails it lands in `errors` instead of sinking the call.
+
+`mumu_wait_activity` is the honest "did my tap navigate" check — it reads what Android reports,
+not what a screenshot looks like mid-animation.
+
+### Flows — scripting a UI sequence
+
+`mumu_flow` runs a list of steps in one call. This is the difference between an agent doing
+5–15 round trips per screen and doing one:
+
+```json
+[
+  {"action": "wait_activity", "target": "com.example.app", "timeout_s": 20},
+  {"action": "tap", "text": "登录"},
+  {"action": "text", "text": "user@example.com"},
+  {"action": "tap", "id": "password"},
+  {"action": "text", "text": "hunter2"},
+  {"action": "tap", "text": "提交"},
+  {"action": "wait_for", "text": "欢迎回来", "timeout_s": 30},
+  {"action": "screenshot"}
+]
+```
+
+| action | fields |
+|---|---|
+| `tap` | `x`/`y`, or a locator |
+| `swipe` | `x1 y1 x2 y2`, optional `duration_ms` |
+| `long_press` | locator or `x`/`y`, optional `duration_ms` |
+| `text` | `text` |
+| `key` | name or numeric keycode |
+| `wait_for` / `wait_gone` | locator, optional `timeout_s` |
+| `wait_activity` | `target` (package or regex) |
+| `assert_text` | locator — fails the flow if absent |
+| `launch` | `package` (+ `activity`) or `component` |
+| `sleep` | `ms`, capped at 30 s |
+| `shell` | `command` |
+| `screenshot` | optional `path` |
+
+A **locator** is `text` / `desc` / `id`, substring by default, with `exact` and `index` to
+disambiguate. It polls the parsed view hierarchy, so it is immune to animation and OCR noise.
+
+A failing flow stops at that step and tells you which one, plus what was actually on screen:
+
+```json
+{
+  "completed": false,
+  "failed_step": 1,
+  "error": "assertion failed: 'zzz' is not on screen",
+  "detail": {"node_count": 36, "sample": ["广告轮播", "游戏中心", "每日新发现"]}
+}
+```
+
+That `sample` is the point: a broken flow is diagnosable without re-running it.
+
 ---
 
 ## Design notes
@@ -263,8 +332,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 54 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 58
+.venv\Scripts\python -m pytest -q                       # hermetic: 88 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 95
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -277,6 +346,8 @@ mumu_mcp/
   errors.py      error taxonomy, errcode -> exception map
   constants.py   keycodes, toolbar names, resolution presets, limits
   root.py        root state, adb root, system overlay, diff-image restore
+  device.py      foreground, launch, battery, proxy, hosts, processes
+  flow.py        scripted step lists, locator resolution, failure reporting
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

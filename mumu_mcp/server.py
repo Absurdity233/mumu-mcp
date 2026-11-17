@@ -29,12 +29,14 @@ from mcp.server.fastmcp import FastMCP
 
 from . import constants as C
 from .adb import Adb
+from .device import Device
 from .errors import (
     AdbUnavailable,
     BadArgument,
     MuMuError,
     Timeout,
 )
+from .flow import Flow, parse_steps
 from .manager import Manager, as_list
 from .root import Root
 
@@ -1235,6 +1237,200 @@ def mumu_import(path: str = "", count: int = 1) -> dict:
         raise BadArgument("path is required")
     return {"result": manager().run("import", "--path", path, "--number", max(1, int(count)),
                                     timeout=900).json_or_empty()}
+
+
+# ---------------------------------------------------------------------------
+# device state and app launching
+# ---------------------------------------------------------------------------
+def device() -> Device:
+    inst = _state.get("device")
+    if inst is None:
+        inst = Device(adb=adb(), manager=manager())
+        _state["device"] = inst
+    return inst
+
+
+def flow() -> Flow:
+    inst = _state.get("flow")
+    if inst is None:
+        inst = Flow(
+            adb=adb(),
+            device=device(),
+            ui_dump=lambda idx, simplify=True: mumu_ui_dump.__wrapped__(idx, simplify),
+            screenshot=lambda idx, path="": mumu_screenshot.__wrapped__(idx, path)["path"],
+        )
+        _state["flow"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_foreground(vmindex: int = 0) -> dict:
+    """Which app/activity is in front right now.
+
+    Reads `dumpsys activity activities` and falls back to the focused window;
+    the two disagree during transitions, so both are consulted.
+    """
+    return {"foreground": device().foreground(vmindex).to_dict()}
+
+
+@mcp.tool()
+@_wrap
+def mumu_wait_activity(vmindex: int = 0, target: str = "", timeout_s: int = 30) -> dict:
+    """Block until the foreground package (or component, or regex) matches `target`.
+
+    This is the reliable "did my tap actually navigate" check — far better than
+    sleeping and hoping, because it keys on what Android itself reports.
+    """
+    fg = device().wait_for_activity(vmindex, target, timeout=max(1, timeout_s))
+    return {"foreground": fg.to_dict(), "matched": target}
+
+
+@mcp.tool()
+@_wrap
+def mumu_launch(vmindex: int = 0, package: str = "", activity: str = "",
+                component: str = "", action: str = "", data: str = "",
+                extras: Any = None, wait: bool = True, force_stop: bool = False) -> dict:
+    """Start an activity through `am start`, and report how long it took.
+
+    Give `component` (`pkg/act`), or `package` (+ `activity`), or an `action`.
+    `wait=True` adds `-W` so the result carries `total_ms` and whether the app was
+    already running — the difference between a cold and a warm launch.
+    """
+    parsed = extras if isinstance(extras, dict) else None
+    if isinstance(extras, str) and extras.strip():
+        try:
+            parsed = json.loads(extras)
+        except json.JSONDecodeError as exc:
+            raise BadArgument(f"extras is not valid JSON: {exc}") from exc
+    return device().launch(vmindex, component=component, package=package, activity=activity,
+                           action=action, data=data, extras=parsed,
+                           wait=wait, force_stop=force_stop)
+
+
+@mcp.tool()
+@_wrap
+def mumu_battery(vmindex: int = 0) -> dict:
+    """Current battery state (level, status, health, temperature, voltage)."""
+    return {"battery": device().battery(vmindex)}
+
+
+@mcp.tool()
+@_wrap
+def mumu_set_battery(vmindex: int = 0, level: int | None = None, status: int | None = None,
+                     temperature: int | None = None, reset: bool = False) -> dict:
+    """Override the reported battery, or `reset=True` to hand control back to the guest.
+
+    Useful for exercising low-battery paths. `status`: 2 charging, 3 discharging,
+    4 not charging, 5 full.
+    """
+    return device().set_battery(vmindex, level=level, status=status,
+                                temperature=temperature, reset=reset)
+
+
+@mcp.tool()
+@_wrap
+def mumu_proxy(vmindex: int = 0) -> dict:
+    """Read the global HTTP proxy apps see (`settings global http_proxy`)."""
+    return device().proxy(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_set_proxy(vmindex: int = 0, host: str = "", port: int = 0) -> dict:
+    """Point every app at an HTTP proxy — the usual way to watch an app's traffic.
+
+    `host=""` clears it. This writes the global setting, so it takes effect for
+    apps immediately and survives until cleared or the data is wiped.
+    """
+    return device().set_proxy(vmindex, host=host, port=port)
+
+
+@mcp.tool()
+@_wrap
+def mumu_hosts(vmindex: int = 0) -> dict:
+    """Current `/system/etc/hosts` mappings, parsed."""
+    return device().hosts(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_add_hosts(vmindex: int = 0, entries: Any = None, replace: bool = False) -> dict:
+    """Pin DNS: add `{"ip": "hostname"}` mappings to `/system/etc/hosts`.
+
+    Needs the root overlay (`mumu_root_system(True)`) because the file is on the
+    read-only system partition. `replace=True` rewrites the file instead of
+    appending. Mappings persist across reboots via the overlay diff image.
+    """
+    parsed = entries
+    if isinstance(entries, str):
+        try:
+            parsed = json.loads(entries)
+        except json.JSONDecodeError as exc:
+            raise BadArgument(f"entries is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise BadArgument("entries must be an object of {ip: hostname}")
+    return device().add_hosts(vmindex, parsed, replace=replace)
+
+
+@mcp.tool()
+@_wrap
+def mumu_storage(vmindex: int = 0) -> dict:
+    """Free and used space on the guest filesystems."""
+    return device().storage(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_processes(vmindex: int = 0, limit: int = 15) -> dict:
+    """Top processes by CPU, plus load average and core count."""
+    return device().processes(vmindex, limit=max(1, limit))
+
+
+@mcp.tool()
+@_wrap
+def mumu_snapshot(vmindex: int = 0) -> dict:
+    """Everything you need before acting, in one call: foreground app, screen,
+    battery, adbd uid, proxy, storage.
+
+    Cheaper than five tools and internally consistent — the foreground app and the
+    screen size come from the same moment. A failed probe lands in `errors`
+    instead of sinking the whole call.
+    """
+    return device().summary(vmindex)
+
+
+# ---------------------------------------------------------------------------
+# scripted flows
+# ---------------------------------------------------------------------------
+@mcp.tool()
+@_wrap
+def mumu_flow(vmindex: int = 0, steps: Any = None, stop_on_error: bool = True) -> dict:
+    """Run a list of UI steps in one call: the tool that replaces a dozen round trips.
+
+    Each step is `{"action": ...}` with these actions:
+
+    | action | fields |
+    |---|---|
+    | `tap` | `x`/`y`, or a locator (`text`/`desc`/`id` + optional `index`, `exact`) |
+    | `swipe` | `x1 y1 x2 y2`, optional `duration_ms` |
+    | `long_press` | locator or `x`/`y`, optional `duration_ms` |
+    | `text` | `text` |
+    | `key` | `key` (name or numeric keycode) |
+    | `wait_for` | locator, optional `timeout_s` |
+    | `wait_gone` | locator, optional `timeout_s` |
+    | `wait_activity` | `target` (package or regex), optional `timeout_s` |
+    | `assert_text` | locator — fails the flow if absent |
+    | `launch` | `package` (+ `activity`), or `component`, optional `force_stop` |
+    | `sleep` | `ms` (capped at 30 s) |
+    | `shell` | `command` |
+    | `screenshot` | optional `path` |
+
+    A locator polls the parsed view hierarchy, so it is immune to animation and
+    OCR noise. Stops at the first failure and reports `failed_step` plus what it
+    saw, which is what makes a broken flow diagnosable without re-running it.
+    """
+    return flow().run(vmindex, parse_steps(steps), stop_on_error=stop_on_error)
 
 
 # ---------------------------------------------------------------------------
