@@ -8,3 +8,7 @@ build/
 dist/
 *.log
 _smoke.py
+
+# scratch scripts used while probing the emulator
+_t_*.py
+_tmp_*
