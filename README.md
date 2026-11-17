@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 93 tools, root included, structured errors.
+used for mobile game automation and app testing. 95 tools, root and environment hiding included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -293,6 +293,52 @@ A failing flow stops at that step and tells you which one, plus what was actuall
 
 That `sample` is the point: a broken flow is diagnosable without re-running it.
 
+### Environment surface — scan and hide
+
+For the case where something on the guest actively looks for emulator or root traces.
+
+| tool | purpose |
+|---|---|
+| `mumu_stealth_scan` | enumerate the leak surface and grade every item; changes nothing |
+| `mumu_stealth_hide` | close the reversible part, re-scan, report what is left |
+
+Every finding is graded **`clean` / `leak` / `unfixable`**, and the headline `verdict` keys on the
+unfixable ones — one structural tell is enough for an integrity check to fail, whatever else got
+cleaned up. `mumu_stealth_hide(restore=True)` puts the original values back; a reboot does too.
+
+**What actually closes, measured:**
+
+| surface | fix |
+|---|---|
+| `ro.hardware`, `ro.product.board`, `ro.boot.verifiedbootstate`, … (7 keys) | rewritten to real-SM-S9210 values |
+| **60** `nemu*` properties (`init.svc.nemuhotd`, `nemud.fps_limit`, …) | **deleted**, not blanked |
+| adbd running as root | `adb unroot` → `uid=2000(shell)` |
+
+`ro.*` cannot be changed with `setprop` after init has read it — KernelSU's `resetprop -n` writes the
+property area directly, which is the only mechanism that works.
+
+Two behaviours worth knowing, both found by testing rather than reading:
+
+- **Deleting beats blanking.** `resetprop -n key ''` leaves the key in the property area, so
+  `getprop` still prints it and a `grep nemu` still hits. `resetprop -d key` removes the entry.
+  The first version blanked and reported success; the re-scan gave it away.
+- **`setenforce 1` hangs this image.** It blocks past a 30 s timeout and leaves adbd `offline`
+  until the instance is restarted — MuMu's init has no enforcing policy to load. So SELinux is
+  graded `unfixable` and left alone, rather than "fixed" and breaking the instance.
+
+**What is reported as `unfixable` instead of faked:**
+
+| surface | why |
+|---|---|
+| `sensor_count: 1` (a real SM-S9210 reports 20+) | needs a faked sensors HAL, not a property |
+| `uname=aarch64` vs `cpuinfo: AuthenticAMD, hypervisor` vs `__x64_sys_*` in kallsyms | closing it needs a uname/kallsyms hook, which is itself a signal |
+| SELinux `Permissive` | see above — cannot be changed at runtime here |
+| `/data/adb/ksu`, `/data/adb/magisk` | KernelSU needs them; a half-move is a *new* inconsistency |
+
+The honest summary: properties and adbd privilege close completely; the kernel-level and
+HAL-level tells do not, and the scan says so up front instead of promising a clean verdict it
+cannot deliver.
+
 ### Kernel input channel
 
 `adb shell input` only does single-pointer events. The touchscreen node exposes the full MT
@@ -366,8 +412,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 110 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 119
+.venv\Scripts\python -m pytest -q                       # hermetic: 129 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 140
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -383,6 +429,7 @@ mumu_mcp/
   device.py      foreground, launch, battery, proxy, hosts, processes
   flow.py        scripted step lists, locator resolution, failure reporting
   gesture.py     kernel input channel, MT-protocol-B frames, raw batching
+  stealth.py     environment surface scan, property/root hiding, grading
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

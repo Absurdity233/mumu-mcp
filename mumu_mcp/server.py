@@ -40,6 +40,7 @@ from .flow import Flow, parse_steps
 from .gesture import Gestures
 from .manager import Manager, as_list
 from .root import Root
+from .stealth import Stealth
 
 logging.basicConfig(
     level=os.environ.get("MUMU_LOG_LEVEL", "INFO").upper(),
@@ -1551,6 +1552,58 @@ def mumu_raw_sequence(vmindex: int = 0, events: Any = None, device: str = "") ->
                               detail={"got": item})
         triples.append((int(item[0]), int(item[1]), int(item[2])))
     return gestures().raw_sequence(vmindex, triples, device=device or None)
+
+
+# ---------------------------------------------------------------------------
+# environment surface: scan and hide
+# ---------------------------------------------------------------------------
+def stealth() -> Stealth:
+    inst = _state.get("stealth")
+    if inst is None:
+        inst = Stealth(adb=adb(), root=root(), manager=manager())
+        _state["stealth"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_stealth_scan(vmindex: int = 0) -> dict:
+    """Enumerate what this instance leaks — emulator traces and root traces — and grade each.
+
+    Read-only. Every finding is `clean`, `leak` (reversible) or `unfixable`, and the
+    headline `verdict` keys on the unfixable ones: a single structural tell is
+    enough for an integrity check to fail, whatever else is cleaned up.
+
+    Needs root, because half the surface is unreadable as `shell`.
+    """
+    return stealth().scan(vmindex).to_dict()
+
+
+@mcp.tool()
+@_wrap
+def mumu_stealth_hide(vmindex: int = 0, properties: bool = True, root_hide: bool = True,
+                      restore: bool = False) -> dict:
+    """Close the reversible part of the surface, then re-scan and report what is left.
+
+    What it actually does:
+
+    * rewrites `ro.*` properties through KernelSU's `resetprop`, which writes the
+      property area directly — `setprop` refuses `ro.` keys after init has read
+      them, so this is the only mechanism that works
+    * blanks any property value carrying a vendor marker (`nemu`, `mumu`, `qemu`,
+      `goldfish`, …)
+    * drops adbd from root to `shell`, and sets SELinux to `Enforcing`
+
+    What it deliberately does **not** fake, and says so in `remaining`: sensor
+    count, the uname/cpuinfo/kallsyms disagreement, loaded modules, and the
+    KernelSU directories. Those need a kernel hook or a faked HAL, and a half-done
+    version of either is a *new* signal rather than a fix.
+
+    `restore=True` puts back the values captured at the first call, so nothing here
+    is a one-way door. A reboot also restores them, since `resetprop` does not
+    persist.
+    """
+    return stealth().hide(vmindex, properties=properties, root=root_hide, restore=restore)
 
 
 # ---------------------------------------------------------------------------
