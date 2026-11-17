@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 87 tools, root included, structured errors.
+used for mobile game automation and app testing. 93 tools, root included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -293,6 +293,40 @@ A failing flow stops at that step and tells you which one, plus what was actuall
 
 That `sample` is the point: a broken flow is diagnosable without re-running it.
 
+### Kernel input channel
+
+`adb shell input` only does single-pointer events. The touchscreen node exposes the full MT
+protocol B, so this writes to it directly:
+
+| tool | purpose |
+|---|---|
+| `mumu_touch_device` | the multitouch node, found by capability — name, axis range, slot count |
+| `mumu_raw_sequence` | **a batch of events in one adb call** |
+| `mumu_raw_event` | one event (each call is ~250 ms apart — read the warning below) |
+| `mumu_pinch` · `mumu_two_finger_drag` · `mumu_two_finger_hold` | multi-touch gestures |
+
+**`mumu_raw_sequence` is the one that works, and the distinction is not cosmetic.** A tap is
+down → SYN → up → SYN within microseconds. Sent as separate `adb shell` calls that becomes a
+~500 ms slow drag, and the app ignores it — verified both ways: batched, tapping the launcher's
+game-centre icon navigates into `com.mumu.store/.MainActivity`; unbatched, nothing happens.
+Single-finger drags written to the node scroll lists correctly.
+
+**Two-finger gestures do not reach the app on this MuMu build.** Pinch and two-finger drag were
+driven with a correct MT-B sequence at coordinates where a single-finger swipe scrolls the same
+list; nothing moved. MuMu's host input bridge forwards single-pointer events and drops multi-slot
+ones, and no MuMu setting changes that. The helpers are kept — they emit a well-formed gesture and
+will work unchanged on a build whose bridge forwards multi-touch — but they are documented as
+platform-limited rather than shipped as if they worked. To zoom or pan today, drive the UI's own
+controls.
+
+```json
+[
+  {"action": "tap", "x": 720, "y": 1600},
+  {"action": "wait_for", "text": "详情"}
+]
+```
+Flows use the standard `input` channel; for a raw event sequence, call `mumu_raw_sequence`.
+
 ---
 
 ## Design notes
@@ -332,8 +366,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 90 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 97
+.venv\Scripts\python -m pytest -q                       # hermetic: 110 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 119
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -348,6 +382,7 @@ mumu_mcp/
   root.py        root state, adb root, system overlay, diff-image restore
   device.py      foreground, launch, battery, proxy, hosts, processes
   flow.py        scripted step lists, locator resolution, failure reporting
+  gesture.py     kernel input channel, MT-protocol-B frames, raw batching
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

@@ -37,6 +37,7 @@ from .errors import (
     Timeout,
 )
 from .flow import Flow, parse_steps
+from .gesture import Gestures
 from .manager import Manager, as_list
 from .root import Root
 
@@ -1431,6 +1432,125 @@ def mumu_flow(vmindex: int = 0, steps: Any = None, stop_on_error: bool = True) -
     saw, which is what makes a broken flow diagnosable without re-running it.
     """
     return flow().run(vmindex, parse_steps(steps), stop_on_error=stop_on_error)
+
+
+# ---------------------------------------------------------------------------
+# gestures — the kernel input channel
+# ---------------------------------------------------------------------------
+def gestures() -> Gestures:
+    inst = _state.get("gestures")
+    if inst is None:
+        inst = Gestures(adb=adb())
+        _state["gestures"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_touch_device(vmindex: int = 0, refresh: bool = False) -> dict:
+    """Report the multitouch input node, found by capability rather than by index.
+
+    Device numbering differs between images and boots, so this looks for
+    `ABS_MT_POSITION_X` and reports the node name, axis range and slot count. The
+    gesture tools use the same discovery, which is why they do not need a device
+    path.
+    """
+    dev = gestures().touch_device(vmindex, refresh=refresh)
+    return {"device": dev.path, "name": dev.name,
+            "max_x": dev.max_x, "max_y": dev.max_y, "slots": dev.slots}
+
+
+@mcp.tool()
+@_wrap
+def mumu_pinch(vmindex: int = 0, cx: int = 0, cy: int = 0, start: int = 120,
+               end: int = 360, steps: int = 8, duration_ms: int = 300,
+               axis: str = "x") -> dict:
+    """Two-finger pinch or zoom around (cx, cy), written as MT-protocol-B events.
+
+    Spans `start` to `end` half-distance: `end > start` zooms in, `end < start`
+    zooms out. `axis` is `x` or `y`.
+
+    **Platform limit, measured:** on MuMu 6.8.x the host input bridge forwards
+    single-pointer events and drops multi-slot ones, so this sequence reaches the
+    kernel but not the app. The helper emits a correct gesture and will work
+    unchanged on a build whose bridge forwards multi-touch; on this build, zoom or
+    pan through the UI's own controls instead. Verify with `mumu_touch_device`
+    and a before/after `mumu_ui_dump` before relying on it.
+    """
+    if axis not in {"x", "y"}:
+        raise BadArgument("axis must be x or y")
+    return gestures().pinch(vmindex, cx, cy, start=start, end=end,
+                            steps=steps, duration_ms=duration_ms, axis=axis)
+
+
+@mcp.tool()
+@_wrap
+def mumu_two_finger_drag(vmindex: int = 0, x1: int = 0, y1: int = 0, x2: int = 0,
+                         y2: int = 0, gap: int = 120, steps: int = 8,
+                         duration_ms: int = 300) -> dict:
+    """Drag with two fingers held `gap` apart — the "move the map" gesture.
+
+    Subject to the same platform limit as `mumu_pinch`: single-finger `mumu_swipe`
+    scrolls and works; this multi-slot gesture does not reach the app on this
+    MuMu build.
+    """
+    return gestures().two_finger_drag(vmindex, x1, y1, x2, y2, gap=gap,
+                                      steps=steps, duration_ms=duration_ms)
+
+
+@mcp.tool()
+@_wrap
+def mumu_two_finger_hold(vmindex: int = 0, x: int = 0, y: int = 0, gap: int = 120,
+                         hold_ms: int = 900) -> dict:
+    """Press and hold with two fingers. Same platform limit as `mumu_pinch`."""
+    return gestures().long_press_two_finger(vmindex, x, y, gap=gap, hold_ms=hold_ms)
+
+
+@mcp.tool()
+@_wrap
+def mumu_raw_event(vmindex: int = 0, event_type: int = 0, code: int = 0, value: int = 0,
+                   device: str = "") -> dict:
+    """Emit one raw input event (`type code value`) to the touchscreen node.
+
+    For anything the gesture helpers do not cover. Linux input codes: EV_SYN=0,
+    EV_KEY=1, EV_ABS=3; ABS_MT_POSITION_X=0x35, ABS_MT_POSITION_Y=0x36,
+    ABS_MT_TRACKING_ID=0x39, BTN_TOUCH=0x14A.
+
+    Each call is its own `adb shell`, so successive events are ~250 ms apart. For
+    a tap or a gesture that is too slow — use `mumu_raw_sequence` to send the whole
+    sequence in one round trip.
+    """
+    return gestures().raw_event(vmindex, event_type, code, value, device=device or None)
+
+
+@mcp.tool()
+@_wrap
+def mumu_raw_sequence(vmindex: int = 0, events: Any = None, device: str = "") -> dict:
+    """Send a batch of raw input events in one adb round trip.
+
+    `events` is a list of `[type, code, value]` triples. A tap is
+    `[[3,47,0],[3,57,300],[3,53,x],[3,54,y],[1,330,1],[0,0,0],[3,57,-1],[1,330,0],[0,0,0]]`.
+
+    Batching is not an optimization, it is what makes the gesture work: splitting
+    a down/up across separate shell calls stretches it into a slow drag, and apps
+    ignore that. Verified by tapping a launcher icon this way and watching the
+    launcher hand over.
+    """
+    parsed = events
+    if isinstance(events, str):
+        try:
+            parsed = json.loads(events)
+        except json.JSONDecodeError as exc:
+            raise BadArgument(f"events is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise BadArgument("events must be a non-empty list of [type, code, value]")
+    triples: list[tuple[int, int, int]] = []
+    for i, item in enumerate(parsed):
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise BadArgument(f"event {i} must be [type, code, value]",
+                              detail={"got": item})
+        triples.append((int(item[0]), int(item[1]), int(item[2])))
+    return gestures().raw_sequence(vmindex, triples, device=device or None)
 
 
 # ---------------------------------------------------------------------------
