@@ -1,8 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 66 tools, two independent channels, structured
-errors.
+used for mobile game automation and app testing. 74 tools, root included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -183,6 +182,48 @@ brittle; the dump hands you `"center": [720, 1600]` for the node whose `text` is
 `mumu_shell` · `mumu_push` · `mumu_pull` · `mumu_logcat` · `mumu_prop_get` · `mumu_prop_set` ·
 `mumu_export` · `mumu_import`
 
+### Root
+
+| tool | what it does |
+|---|---|
+| `mumu_root_status` | uid, SELinux, `/system` writability and *how* it is writable, whether that survives reboot, whether `su` exists |
+| `mumu_root_adb` | `adb root` / `adb unroot` — adbd as uid 0, no reboot, instance keeps running |
+| `mumu_root_permission` | set `root_permission` + restart, so root comes up at boot |
+| `mumu_root_system` | make `/system` writable via MuMu's overlay, or go back to the stock image |
+| `mumu_root_restore_system` | delete the overlay diff image — the clean undo for the above |
+| `mumu_root_push_system` | copy a file into `/system`, refusing before it half-succeeds |
+| `mumu_root_pull_system` | copy out of `/data/data` and other paths the `shell` user cannot read |
+| `mumu_root_exec` | shell with a uid assertion, so a non-root run fails loudly instead of quietly |
+| `mumu_root_remount` | `mount -o rw,remount`, with the reason it cannot work here |
+
+**What root actually looks like on MuMu** — measured on 6.8.x / Android 15, not assumed:
+
+- **There is no `su` binary.** `root_permission=true` starts *adbd as root*
+  (`uid=0`, context `u:r:su:s0`). So `mumu_shell` is already root and nothing needs
+  `su -c`; conversely, anything that shells out to `su` fails. To drop privileges, use
+  `run-as <package>`.
+- **`/system` is read-only at the block level, writable in practice.** `/dev/block/sda6`
+  is mounted `ro`, so `mount -o rw,remount /system` fails with `'/dev/block/sda6' is
+  read-only`. With `system_disk_readonly=false`, MuMu stacks an overlayfs instead:
+
+  ```
+  overlay on /system type overlay (rw,
+      lowerdir=/system, upperdir=/mnt/scratch/upperdir, workdir=/mnt/scratch/workdir)
+  ```
+
+  That upperdir is **not visible inside the guest** (`/mnt/scratch` is an empty tmpfs
+  there). It lives on the host as `<vm>/system-diff.vdi` and grows as you write — 9.4 MB
+  → 11.5 MB over a few files — so writes **persist across reboots** while the stock image
+  stays untouched. `mumu_root_restore_system` deletes that diff image: because the lower
+  layer was never modified, that is a complete restore, not a rollback of half-applied
+  changes.
+- **`service.adb.root=1` is per-boot.** A reboot brings adbd back as `shell` even with
+  `root_permission=true`; that setting decides the *next* boot. `mumu_root_adb` fixes the
+  current one, `mumu_root_permission` fixes all future ones.
+
+SELinux is `Permissive` on MuMu's image, so policy denials are not the obstacle they
+would be on a stock device.
+
 ---
 
 ## Design notes
@@ -195,7 +236,9 @@ purpose:
 2. **A non-zero exit is not a dead connection.** `uiautomator dump` exits 1 *after* printing
    `UI hierchary dumped to: …`; `pm clear` exits non-zero on a missing package. Only real transport
    markers (`device offline`, `cannot connect`, …) invalidate the cached endpoint, otherwise the UI
-   dump tool would tear down its own connection every single call.
+   dump tool would tear down its own connection every single call. A genuine transport failure is
+   retried once with the endpoint cache dropped, because a restarted instance leaves a dead socket
+   registered with adb.
 3. **Encoding.** MuMu speaks UTF-8. Decoding with the host codepage (what `subprocess(text=True)`
    does on a zh-CN Windows) turns every `app_name` into `���˽Ȩ`. Bytes are decoded explicitly,
    UTF-8 first, GB18030 as the guest-output fallback.
@@ -204,6 +247,9 @@ purpose:
    a typed `key_not_writable` rather than a silent no-op.
 5. **Shell escaping.** `input text` needs `%s` for spaces and backslashes for `& < > ' " ( ) | ;`.
    Escape only spaces and half of a login form breaks.
+
+Root has its own set of surprises — no `su`, a host-side overlay, per-boot `adb root` — written up
+under [Root](#root) rather than repeated here.
 
 And four interface decisions aimed at the caller being a model:
 
@@ -217,8 +263,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 35 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 37
+.venv\Scripts\python -m pytest -q                       # hermetic: 54 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 58
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -230,6 +276,7 @@ mumu_mcp/
   adb.py         adb transport + endpoint resolution + input escaping
   errors.py      error taxonomy, errcode -> exception map
   constants.py   keycodes, toolbar names, resolution presets, limits
+  root.py        root state, adb root, system overlay, diff-image restore
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

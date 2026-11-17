@@ -36,6 +36,7 @@ from .errors import (
     Timeout,
 )
 from .manager import Manager, as_list
+from .root import Root
 
 logging.basicConfig(
     level=os.environ.get("MUMU_LOG_LEVEL", "INFO").upper(),
@@ -53,7 +54,7 @@ mcp = FastMCP(
     ),
 )
 
-_state: dict[str, Any] = {"manager": None, "adb": None}
+_state: dict[str, Any] = {"manager": None, "adb": None, "root": None}
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,14 @@ def adb() -> Adb:
             explicit=os.environ.get("MUMU_ADB") or None,
         )
         _state["adb"] = inst
+    return inst
+
+
+def root() -> Root:
+    inst = _state.get("root")
+    if inst is None:
+        inst = Root(adb=adb(), manager=manager())
+        _state["root"] = inst
     return inst
 
 
@@ -415,12 +424,207 @@ def mumu_set_device(vmindex: int = 0, brand: str = "", model: str = "", miit: st
     return {"applied": pairs, "result": manager().setting_set(vmindex, pairs)}
 
 
+# ---------------------------------------------------------------------------
+# root
+# ---------------------------------------------------------------------------
 @mcp.tool()
 @_wrap
-def mumu_set_root(vmindex: int = 0, enabled: bool = True) -> dict:
-    """Toggle the root permission flag for the instance."""
-    return {"root": enabled,
-            "result": manager().setting_set(vmindex, {"root_permission": "true" if enabled else "false"})}
+def mumu_root_status(vmindex: int = 0) -> dict:
+    """Report what root looks like on this instance, verified rather than assumed.
+
+    Covers: whether adbd is uid 0, SELinux mode, whether `/system` is writable and
+    through what mechanism, whether that mechanism survives a reboot, whether a
+    `su` binary exists at all, and the two MuMu settings behind it.
+
+    Read this before calling any other `mumu_root_*` tool — on MuMu the answers are
+    not what a generic Android assumption predicts.
+    """
+    return {"root": root().state(vmindex).to_dict()}
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_adb(vmindex: int = 0, enabled: bool = True) -> dict:
+    """`adb root` / `adb unroot`: run adbd as uid 0 (or drop it back to `shell`).
+
+    Fast, and the instance keeps running — no reboot. This is the cheapest way to
+    get a root shell, because there is no `su` binary on MuMu to invoke.
+    """
+    action = root()
+    return action.enable_adb_root(vmindex) if enabled else action.disable_adb_root(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_permission(vmindex: int = 0, enabled: bool = True) -> dict:
+    """Set MuMu's `root_permission` and restart, so adbd comes up as root at boot.
+
+    Use this when you want root to *stay* across reboots; `mumu_root_adb` only
+    affects the running instance.
+    """
+    return root().set_permission(vmindex, enabled)
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_system(vmindex: int = 0, writable: bool = True) -> dict:
+    """Make `/system` writable (or read-only again) and restart.
+
+    On MuMu the block device stays read-only; what this toggles is
+    `system_disk_readonly`, which makes MuMu stack an overlayfs over `/system`
+    backed by a host-side diff image. Writes therefore persist across reboots while
+    the stock image stays untouched — `mumu_root_restore_system` is the clean undo.
+
+    `writable=False` goes back to the stock read-only image.
+    """
+    return root().set_system_writable(vmindex, writable)
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_restore_system(vmindex: int = 0, confirm: bool = False) -> dict:
+    """Reset `/system` to stock by deleting the overlay diff image.
+
+    The stock system image was never modified, so removing `<vm>/system-diff.vdi`
+    on the host is a complete restore and reclaims the space the overlay used.
+
+    Stop the instance first — the image is mapped while it runs. Requires
+    `confirm=True`; the file is deleted, not archived.
+    """
+    return root().restore_system_diff(vmindex, confirm=confirm)
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_remount(vmindex: int = 0, target: str = "/system") -> dict:
+    """Try `mount -o rw,remount <target>` and explain the result.
+
+    On stock MuMu 6.x this cannot succeed — the block device itself is read-only —
+    so the payload says to use `mumu_root_system(True)` instead of just reporting a
+    mount failure.
+    """
+    return root().remount(vmindex, target)
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_exec(vmindex: int = 0, command: str = "", timeout_s: int = 60) -> dict:
+    """Run a shell command with an explicit root check, refusing silently-broken runs.
+
+    `mumu_shell` already runs as root when adbd is root, but it will happily run as
+    `shell` and let a command fail halfway. This asserts the uid first and tells you
+    exactly what to fix if it is not root.
+    """
+    if not command:
+        raise BadArgument("command is required")
+    state = root().state(vmindex)
+    if not state.is_root:
+        raise BadArgument(
+            "adbd is not root, so this command would run as `shell`",
+            detail={
+                "uid": state.uid,
+                "fix": "call mumu_root_adb(enabled=True), or mumu_root_permission(True)",
+            },
+        )
+    return {
+        "uid": state.uid,
+        "context": state.context,
+        "command": command,
+        "output": adb().shell(vmindex, command, timeout=max(5, timeout_s)),
+    }
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_push_system(vmindex: int = 0, local_path: str = "",
+                          remote_path: str = "/system/etc/") -> dict:
+    """Copy a host file into `/system`, creating the overlay first if needed.
+
+    Verifies the destination is actually writable before copying, so a failure is a
+    clear "system is read-only, call mumu_root_system(True)" rather than a partial
+    push followed by a confusing `adb` error.
+    """
+    if not local_path:
+        raise BadArgument("local_path is required")
+    if not Path(local_path).is_file():
+        raise BadArgument(f"file not found: {local_path}")
+    if not remote_path.startswith("/system/"):
+        raise BadArgument("remote_path must live under /system")
+    state = root().state(vmindex)
+    if not state.is_root:
+        raise BadArgument("adbd is not root; call mumu_root_adb(True) first",
+                          detail={"uid": state.uid})
+    if not state.system_writable:
+        raise BadArgument(
+            "/system is read-only; call mumu_root_system(True) to enable the overlay first",
+            detail={"system_overlay": state.overlay},
+        )
+    target = remote_path.rstrip("/") + "/" + Path(local_path).name
+    adb().push(vmindex, local_path, target)
+    out = adb().shell(vmindex, f"ls -l {target}; chmod 644 {target} 2>&1")
+    return {
+        "pushed": target,
+        "listed": out.strip(),
+        "persists_reboot": True,
+        "note": "written through the overlay; mumu_root_restore_system undoes it",
+    }
+
+
+@mcp.tool()
+@_wrap
+def mumu_root_pull_system(vmindex: int = 0, remote_path: str = "", local_path: str = "") -> dict:
+    """Copy any guest file out to the host — including `/data/data` of other apps.
+
+    The plain `mumu_pull` refuses paths the `shell` user cannot read; with adbd as
+    root there is no such restriction, which is what makes this its own tool.
+
+    `adb pull` on a directory succeeds and reports 0 bytes unless `-a` is used, so
+    directories are detected up front and copied with `-a` instead of returning a
+    silently empty file.
+    """
+    if not (remote_path and local_path):
+        raise BadArgument("remote_path and local_path are required")
+    state = root().state(vmindex)
+    if not state.is_root:
+        raise BadArgument("adbd is not root, so protected paths are unreadable",
+                          detail={"uid": state.uid, "fix": "mumu_root_adb(True)"})
+
+    exists = adb().shell(vmindex, f"[ -e {remote_path} ] && echo yes || echo no").strip()
+    if exists != "yes":
+        raise BadArgument(
+            f"no such path in the guest: {remote_path}",
+            detail={"hint": "adb pull reports success for missing paths, so this is checked first"},
+        )
+
+    kind = adb().shell(vmindex, f"[ -d {remote_path} ] && echo dir || echo file").strip()
+    if kind == "dir":
+        adb().run(vmindex, "pull", "-a", remote_path, local_path, timeout=300)
+        dest = Path(local_path)
+        if not dest.exists():
+            raise AdbUnavailable("pull reported success but nothing landed on disk",
+                                 detail={"remote": remote_path, "local": local_path})
+        files = [p for p in dest.rglob("*") if p.is_file()]
+        return {
+            "pulled": str(dest),
+            "kind": "directory",
+            "files": len(files),
+            "bytes": sum(p.stat().st_size for p in files),
+        }
+
+    adb().pull(vmindex, remote_path, local_path, timeout=300)
+    dest = Path(local_path)
+    if not dest.is_file():
+        raise AdbUnavailable("pull reported success but no file was written",
+                             detail={"remote": remote_path, "local": local_path})
+    size = dest.stat().st_size
+    if size == 0:
+        # A real empty file is possible, but far more often this is a path the
+        # guest could not produce — say so instead of handing back a 0-byte file.
+        check = adb().shell(vmindex, f"ls -l {remote_path} 2>&1").strip()
+        return {"pulled": str(dest), "bytes": 0, "kind": "file",
+                "warning": "empty file copied; verify the source",
+                "source_listing": check}
+    return {"pulled": str(dest), "bytes": size, "kind": "file"}
 
 
 @mcp.tool()

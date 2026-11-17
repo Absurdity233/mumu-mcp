@@ -87,22 +87,32 @@ class Adb:
 
         legacy_port = 16384 + vmindex * 32
         if _port_open("127.0.0.1", legacy_port):
-            self._endpoint[vmindex] = f"127.0.0.1:{legacy_port}"
-            log.info("index %s: NAT endpoint %s", vmindex, self._endpoint[vmindex])
-            return self._endpoint[vmindex]
+            chosen = f"127.0.0.1:{legacy_port}"
+            self._remember(vmindex, chosen, "NAT loopback")
+            return chosen
 
         ip = self._guest_ip(vmindex)
         if not ip:
             raise AdbUnavailable(
-                f"cannot resolve an adb endpoint for index {vmindex}",
+                f"index {vmindex} has no reachable adb: the guest is not up yet",
                 detail={
                     "tried": [f"127.0.0.1:{legacy_port}", "guest wlan0"],
-                    "hint": "start the instance, or pass --adb host:port",
+                    "hint": "if the instance is starting, retry or call mumu_boot_ready first",
                 },
             )
-        self._endpoint[vmindex] = f"{ip}:{GUEST_ADB_PORT}"
-        log.info("index %s: bridged endpoint %s", vmindex, self._endpoint[vmindex])
-        return self._endpoint[vmindex]
+        chosen = f"{ip}:{GUEST_ADB_PORT}"
+        self._remember(vmindex, chosen, "bridged LAN")
+        return chosen
+
+    def _remember(self, vmindex: int, endpoint: str, how: str) -> None:
+        """Cache an endpoint, logging only when it actually changes.
+
+        `state()`-style tools call `shell` a dozen times; logging the endpoint on
+        every call turns the log into noise and hides the real messages.
+        """
+        if self._endpoint.get(vmindex) != endpoint:
+            log.info("index %s: %s endpoint %s", vmindex, how, endpoint)
+        self._endpoint[vmindex] = endpoint
 
     def _guest_ip(self, vmindex: int) -> str | None:
         try:
@@ -113,7 +123,44 @@ class Adb:
         return m.group(1) if m else None
 
     # -- transport ---------------------------------------------------------
-    def run(self, vmindex: int, *args: Any, timeout: float = 30.0, connect: bool = True) -> str:
+    def run(self, vmindex: int, *args: Any, timeout: float = 30.0, connect: bool = True,
+            retries: int = 1) -> str:
+        last_error = ""
+        for attempt in range(retries + 1):
+            try:
+                return self._run_once(vmindex, *args, timeout=timeout, connect=connect)
+            except AdbUnavailable as exc:
+                last_error = str(exc)
+                transport = getattr(exc, "detail", {}).get("transport", False)
+                if not transport or attempt >= retries:
+                    raise
+                # A restarted instance leaves a stale TCP socket in adb's table
+                # ("device offline"). Dropping the cached endpoint and
+                # reconnecting is what actually clears it.
+                log.info("index %s: retrying after %s", vmindex, last_error.strip()[:60])
+                self._endpoint.pop(vmindex, None)
+                self._checked.clear()
+                time.sleep(1.5)
+        raise AdbUnavailable(last_error)  # pragma: no cover - loop always returns or raises
+
+    def adb_endpoint_hint(self, vmindex: int) -> str:
+        """Last known endpoint, for cache bookkeeping without a fresh probe."""
+        return self._endpoint.get(vmindex, "")
+
+    def invalidate(self, vmindex: int | None = None) -> None:
+        """Forget a cached endpoint after the instance restarts.
+
+        A restarted guest comes back with a dead socket, and adb reports
+        `device offline` until it reconnects — so anything that restarts an
+        instance must call this.
+        """
+        if vmindex is None:
+            self._endpoint.clear()
+        else:
+            self._endpoint.pop(vmindex, None)
+        self._checked.clear()
+
+    def _run_once(self, vmindex: int, *args: Any, timeout: float = 30.0, connect: bool = True) -> str:
         target = self.endpoint(vmindex, refresh=connect)
         if connect:
             self.connect(target)
@@ -134,10 +181,9 @@ class Adb:
             # command that simply exits non-zero (uiautomator dump exits 1 after
             # printing its path, `pm clear` on a missing package, ...) must NOT
             # tear down a perfectly healthy connection.
-            self._endpoint.pop(vmindex, None)
             raise AdbUnavailable(
                 err or out or f"adb exited {proc.returncode}",
-                detail={"target": target, "argv": argv},
+                detail={"target": target, "argv": argv, "transport": True},
             )
         return out or err
 
