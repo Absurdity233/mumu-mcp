@@ -340,21 +340,26 @@ class Stealth:
 
         # Root hiding must run before the final scan: it drops adbd to `shell`,
         # and the scan needs root to read the surface. Scanning first and hiding
-        # second is what makes a re-scan impossible.
+        # second is what makes a re-scan impossible — but reporting the *pre-hide*
+        # scan as the result is wrong too, so the half that does not need root
+        # (`id`, getprop) is re-read afterwards.
         root_stage: dict[str, Any] | None = None
         if root:
-            scan_before = self.scan(vmindex)
+            scan = self.scan(vmindex)
             root_stage = self._hide_root(vmindex)
             applied["root"] = root_stage
 
-        scan = self.scan(vmindex) if root_stage is None else scan_before
-        if root_stage is not None:
-            # Re-read what can be read without root; the rest is what the hide
-            # stage already reported as `remaining`.
-            scan = Scan(findings=[f for f in scan.findings
-                                  if f.name not in {"properties", "vendor_markers"}])
             props = self._collect_props(vmindex)
-            scan.findings.extend([self._props_finding(props), self._markers_finding(props)])
+            refreshed = {f.name: f for f in scan.findings}
+            refreshed["properties"] = self._props_finding(props)
+            refreshed["vendor_markers"] = self._markers_finding(props)
+            # `id` and `getenforce` work as `shell`; refresh them so the report
+            # describes the state *after* the hide, not before it.
+            refreshed["adbd_privilege"] = self._debug_finding(vmindex)
+            refreshed["selinux"] = self._selinux_finding(vmindex)
+            scan = Scan(findings=list(refreshed.values()))
+        else:
+            scan = self.scan(vmindex)
 
         return {
             "applied": applied,
