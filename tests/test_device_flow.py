@@ -334,6 +334,46 @@ def test_flow_launch_delegates_to_device():
 
 
 # ---------------------------------------------------------------------------
+# flow: hierarchy caching
+# ---------------------------------------------------------------------------
+def test_read_only_steps_reuse_one_dump():
+    """A dump costs ~4 s; assert_text twice on one screen must not pay twice."""
+    calls = {"n": 0}
+
+    def counting_dump(idx, simplify=True):
+        calls["n"] += 1
+        return {"count": len(NODES), "nodes": NODES}
+
+    from mumu_mcp.flow import Flow
+
+    f = Flow(adb=_FakeAdb(), device=_FakeDevice(), ui_dump=counting_dump,
+             screenshot=lambda idx, path="": path)
+    out = f.run(0, [{"action": "assert_text", "text": "登录"},
+                    {"action": "assert_text", "desc": "关闭"},
+                    {"action": "wait_for", "desc": "关闭"}])
+    assert out["completed"] is True
+    assert calls["n"] == 1
+
+
+def test_mutating_step_invalidates_cache():
+    calls = {"n": 0}
+
+    def counting_dump(idx, simplify=True):
+        calls["n"] += 1
+        return {"count": len(NODES), "nodes": NODES}
+
+    from mumu_mcp.flow import Flow
+
+    f = Flow(adb=_FakeAdb(), device=_FakeDevice(), ui_dump=counting_dump,
+             screenshot=lambda idx, path="": path)
+    f.run(0, [{"action": "assert_text", "text": "登录"},
+              {"action": "tap", "x": 1, "y": 2},
+              {"action": "assert_text", "text": "登录"}])
+    # one dump for the first assert, another after the tap
+    assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
 # live
 # ---------------------------------------------------------------------------
 @LIVE

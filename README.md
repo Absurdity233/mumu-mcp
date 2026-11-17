@@ -332,8 +332,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 88 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 95
+.venv\Scripts\python -m pytest -q                       # hermetic: 90 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 97
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 

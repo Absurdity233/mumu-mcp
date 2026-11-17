@@ -40,6 +40,11 @@ STEP_KINDS = {
     "launch", "sleep", "shell", "screenshot",
 }
 
+# Steps that can change what is on screen, so the cached hierarchy must be
+# dropped afterwards. `wait_for`/`assert_text`/`screenshot` are read-only.
+MUTATING_STEPS = {"tap", "swipe", "long_press", "text", "key", "launch",
+                  "wait_activity", "wait_gone", "shell", "sleep"}
+
 
 @dataclass
 class StepResult:
@@ -70,6 +75,25 @@ class Flow:
         self.device = device
         self._ui_dump = ui_dump
         self._screenshot = screenshot
+        # One `uiautomator dump` costs ~4 s end-to-end on this image, so the tree
+        # is cached between steps: `assert_text` then `tap` on the same screen
+        # should not pay for it twice. The TTL has to exceed a single dump or the
+        # cache never hits (it would always look stale on return). Any action
+        # that can change the screen invalidates it explicitly.
+        self._tree: dict[str, Any] | None = None
+        self._tree_at: float = 0.0
+        self._tree_ttl: float = 12.0
+
+    def _dump(self, vmindex: int) -> dict[str, Any]:
+        now = time.monotonic()
+        if self._tree is not None and now - self._tree_at < self._tree_ttl:
+            return self._tree
+        self._tree = self._ui_dump(vmindex, simplify=True)
+        self._tree_at = time.monotonic()
+        return self._tree
+
+    def _invalidate(self) -> None:
+        self._tree = None
 
     def run(self, vmindex: int, steps: Any, *, stop_on_error: bool = True) -> dict[str, Any]:
         if not isinstance(steps, list) or not steps:
@@ -91,6 +115,8 @@ class Flow:
             t0 = time.monotonic()
             try:
                 detail = self._dispatch(vmindex, kind, raw)
+                if kind in MUTATING_STEPS:
+                    self._invalidate()
                 results.append(StepResult(i, kind, True, int((time.monotonic() - t0) * 1000), detail))
             except MuMuError as exc:
                 results.append(StepResult(i, kind, False, int((time.monotonic() - t0) * 1000),
@@ -198,7 +224,7 @@ class Flow:
         deadline = time.monotonic() + max(0.5, timeout)
         last_count = -1
         while time.monotonic() < deadline:
-            dump = self._ui_dump(vmindex, simplify=True)
+            dump = self._dump(vmindex)
             hits = _match(dump["nodes"], text=text, desc=desc, rid=rid, exact=exact)
             last_count = len(hits)
             if len(hits) > index:
@@ -214,7 +240,7 @@ class Flow:
         if gone:
             deadline = time.monotonic() + max(0.5, timeout)
             while time.monotonic() < deadline:
-                dump = self._ui_dump(vmindex, simplify=True)
+                dump = self._dump(vmindex)
                 if not _match(dump["nodes"], text=step.get("text", ""), desc=step.get("desc", ""),
                               rid=step.get("id", ""), exact=bool(step.get("exact", False))):
                     return {"gone": True, "waited_s": round(timeout - (deadline - time.monotonic()), 1)}
@@ -228,7 +254,7 @@ class Flow:
         want = step.get("text") or step.get("desc") or step.get("id")
         if not want:
             raise BadArgument("assert_text needs `text` (or desc/id)")
-        dump = self._ui_dump(vmindex, simplify=True)
+        dump = self._dump(vmindex)
         if not _match(dump["nodes"], text=step.get("text", ""), desc=step.get("desc", ""),
                       rid=step.get("id", ""), exact=bool(step.get("exact", False))):
             raise BadArgument(
