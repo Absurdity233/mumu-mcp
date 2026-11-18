@@ -42,6 +42,7 @@ from .manager import Manager, as_list
 from .root import Root
 from .stealth import Stealth
 from .uname import UnamePatcher
+from .uname_daemon import UnameDaemon
 
 logging.basicConfig(
     level=os.environ.get("MUMU_LOG_LEVEL", "INFO").upper(),
@@ -1747,6 +1748,45 @@ def mumu_uname_verify(vmindex: int = 0, pid: int = 0, addr: str = "0x204200") ->
     if pid <= 0:
         raise BadArgument("pid is required")
     return uname_patcher().verify_struct(vmindex, pid, addr)
+
+
+def uname_daemon() -> UnameDaemon:
+    inst = _state.get("uname_daemon")
+    if inst is None:
+        inst = UnameDaemon(adb=adb(), root=root())
+        _state["uname_daemon"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_daemon_start(vmindex: int = 0, names: str = "", limit: int = 8) -> dict:
+    """Attach the uname tracer to matching processes and keep them traced.
+
+    `names` is a comma-separated list of process-name substrings (default: the shell tools
+    a check would call). `limit` caps how many are traced — each one costs a ptrace stop
+    per syscall, so an unbounded fan-out makes the whole instance crawl.
+
+    This is the system-wide alternative to `mumu_uname_patch`, which covers one pid. It is
+    not a kernel hook: a process is untraced between `exec` and the attach, so a target
+    that calls `uname` in its first few instructions can still see the truth once.
+    """
+    wanted = [n.strip() for n in names.split(",") if n.strip()] or None
+    return uname_daemon().start(vmindex, names=wanted, limit=limit)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_daemon_status(vmindex: int = 0) -> dict:
+    """Which processes are traced right now, and what `uname` currently reports."""
+    return uname_daemon().status(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_daemon_stop(vmindex: int = 0, pid: int = 0) -> dict:
+    """Stop the tracers. `PTRACE_O_EXITKILL` means the traced processes exit too."""
+    return uname_daemon().stop(vmindex, pid)
 
 
 # ---------------------------------------------------------------------------
