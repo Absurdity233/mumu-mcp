@@ -41,6 +41,7 @@ from .gesture import Gestures
 from .manager import Manager, as_list
 from .root import Root
 from .stealth import Stealth
+from .uname import UnamePatcher
 
 logging.basicConfig(
     level=os.environ.get("MUMU_LOG_LEVEL", "INFO").upper(),
@@ -1671,6 +1672,81 @@ def mumu_stealth_set_feature(vmindex: int = 0, name: str = "", enabled: bool = T
     rather than trusting its own `getenforce`.
     """
     return stealth().set_feature(vmindex, name, enabled)
+
+
+# ---------------------------------------------------------------------------
+# syscall-level uname patch
+# ---------------------------------------------------------------------------
+def uname_patcher() -> UnamePatcher:
+    inst = _state.get("uname")
+    if inst is None:
+        inst = UnamePatcher(adb=adb(), root=root())
+        _state["uname"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_status(vmindex: int = 0) -> dict:
+    """What `uname` reports right now, and whether a tracer is holding a pid.
+
+    `uname(2)` is the last tell that properties and bind mounts cannot reach — it is
+    a syscall, not a file.
+    """
+    return uname_patcher().status(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_selftest(vmindex: int = 0) -> dict:
+    """Prove the syscall rewrite works, with a built-in target that calls uname itself.
+
+    Worth running before trusting the patch on a real app. Testing with `uname` from
+    a shell gives a false negative: the shell forks, so the syscall happens in a
+    child the tracer never attached to. The bundled target calls it in its own
+    thread, and this reports the observable before/after strings.
+    """
+    return uname_patcher().self_test(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_patch(vmindex: int = 0, pid: int = 0, settle_s: int = 3) -> dict:
+    """Attach the ptrace tracer to `pid` so its `uname` reports a handset kernel.
+
+    This is the only mechanism that covers a target which calls the syscall
+    directly, ships its own loader, or clears `LD_PRELOAD` — it sits below libc.
+
+    Two costs, stated rather than discovered later:
+
+    * every traced thread pays a ptrace stop per syscall, so the target runs slower;
+    * `PTRACE_O_EXITKILL` is set, so killing the tracer kills the tracee too. That
+      keeps a crashed tracer from leaving a game permanently stopped.
+
+    Find the pid with `mumu_processes`. Needs root.
+    """
+    return uname_patcher().attach(vmindex, pid, settle_s=settle_s)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_detach(vmindex: int = 0, pid: int = 0) -> dict:
+    """Stop the tracer. The traced process exits too — restart it afterwards."""
+    return uname_patcher().detach(vmindex, pid)
+
+
+@mcp.tool()
+@_wrap
+def mumu_uname_verify(vmindex: int = 0, pid: int = 0, addr: str = "0x204200") -> dict:
+    """Read the utsname bytes out of the tracee's memory to confirm the write landed.
+
+    A `PTRACE_POKEDATA` that returns zero only means the kernel accepted the call;
+    reading it back through `/proc/<pid>/mem` is what proves the target will see the
+    value. This is the check that caught an argument-order bug in the tracer.
+    """
+    if pid <= 0:
+        raise BadArgument("pid is required")
+    return uname_patcher().verify_struct(vmindex, pid, addr)
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 99 tools, root and environment hiding included, structured errors.
+used for mobile game automation and app testing. 104 tools, root, environment hiding and syscall-level uname patching, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -418,8 +418,42 @@ Final state on this image:
 clean:      properties, vendor_markers, sensor_count, loaded_modules, su_binary,
             selinux, dmi, cpuinfo, clocksource, block_devices        (10)
 leak:       root_dirs, adbd_privilege                                (2, fixable)
-unfixable:  uname -r                                                 (1)
+unfixable:  uname_r → closeable with mumu_uname_patch                (see below)
 ```
+
+### Syscall layer — `uname(2)`
+
+`uname` was the one tell neither `resetprop` nor bind mounts could reach: it is a
+syscall, not a file. Verified — after covering `/proc/version`, `uname -r` still
+printed `6.1.90-perf+`.
+
+`native/uname_patch` is a ptrace tracer that attaches to a pid, breaks on syscall
+exit, and rewrites the `utsname` struct in the tracee. It sits below libc, so it
+works against a target that calls the syscall directly, ships its own loader, or
+clears `LD_PRELOAD`.
+
+```python
+mumu_uname_selftest()        # prove it works, with a built-in target
+mumu_uname_patch(pid=...)    # attach to a real app
+mumu_uname_verify(pid=...)   # read the struct back out of /proc/<pid>/mem
+mumu_uname_detach(pid=...)   # stop (kills the tracee — see below)
+```
+
+Measured end to end:
+
+```
+before: 6.1.90-perf+|aarch64
+after : 6.1.75-android14-11-g4d9e0d1b2c3f|aarch64
+```
+
+Two costs, stated rather than discovered later: every traced thread pays a ptrace
+stop per syscall, and `PTRACE_O_EXITKILL` means killing the tracer kills the tracee
+(so a crashed tracer cannot leave a game permanently stopped).
+
+The binaries are freestanding x86-64 assembly because this host has clang but no
+Android sysroot, and the device has no headers. `native/README.md` records the three
+bugs that took — wait-status decoding (`0x2343`, not `0x7f`), `PTRACE_POKEDATA`
+argument order, and 65-byte struct padding.
 
 ### Kernel input channel
 
@@ -494,8 +528,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 166 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 180
+.venv\Scripts\python -m pytest -q                       # hermetic: 188 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 204
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -514,6 +548,7 @@ mumu_mcp/
   stealth.py     environment surface scan, property/root hiding, grading, bind-mount layer
   fakeprofile.py the ARM/DMI/clocksource content the deep layer installs
 module/        KernelSU module: reapplies everything on boot
+native/        ptrace uname tracer + LD_PRELOAD shim (freestanding asm)
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```
