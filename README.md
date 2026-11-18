@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 97 tools, root and environment hiding included, structured errors.
+used for mobile game automation and app testing. 99 tools, root and environment hiding included, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -303,6 +303,8 @@ For the case where something on the guest actively looks for emulator or root tr
 | `mumu_stealth_hide` | close the reversible part, re-scan, report what is left |
 | `mumu_stealth_deep` | bind-mount over the files a professional check reads |
 | `mumu_stealth_deep_restore` | unmount every override and delete the staged fakes |
+| `mumu_stealth_features` | list KernelSU's kernel-side switches |
+| `mumu_stealth_set_feature` | toggle one (`selinux_hide`, `kernel_umount`, …) and verify |
 
 Every finding is graded **`clean` / `leak` / `unfixable`**, and the headline `verdict` keys on the
 unfixable ones — one structural tell is enough for an integrity check to fail, whatever else got
@@ -368,10 +370,8 @@ also clears them.
 | tell | why |
 |---|---|
 | `uname(2)` → `uname -r` still `6.1.90-perf+` | a syscall, not a file. Closing it needs an `LD_PRELOAD` shim (per-process — useless against a game with its own loader) or a kernel hook, which is a stronger signal than the leak |
-| `sensor_count: 1` | `sensorservice` reports it; needs a faked sensors HAL, which this image does not ship |
-| SELinux `Permissive` | `setenforce 1` hangs the image and takes adbd offline (measured) |
-| `/data/adb/ksu` | KernelSU needs it; a half-move is a new inconsistency |
-| `hypervisor` CPU flag | gone once `cpuinfo` is overridden — the flag lives in that file |
+| `/data/adb/ksu`, `/data/adb/modules` | KernelSU needs them; a half-move is a new inconsistency |
+| SELinux `Permissive` | closed for app UIDs by KernelSU's `selinux_hide`; root still reads the truth, and `setenforce` hangs the image |
 
 So the sequence that actually gets you furthest:
 
@@ -384,6 +384,42 @@ mumu_root_adb(enabled=False) # drop adbd last, or it re-exposes root
 
 After that, the remaining surface is the sensor count, SELinux's mode, and `uname -r`. Those three are
 not closable on this image, and no amount of property work changes that.
+
+### Persistent module — `module/`
+
+Everything above is runtime state: `resetprop` writes the property area and bind mounts die with the
+namespace. `module/` packages it as a KernelSU module so it reapplies on every boot, with no PC
+attached:
+
+```bash
+cd module && zip -r ../dist/mumu-stealth.zip *
+adb push ../dist/mumu-stealth.zip /data/local/tmp/
+adb shell ksud module install /data/local/tmp/mumu-stealth.zip
+```
+
+Verified by rebooting and reading as a plain user: cpuinfo ARM, DMI Samsung, 0 `x64_sys`, 59 vendor
+properties deleted, and the 10 mounts still present 90 s after boot.
+
+Three things that had to be right for it to hold, each found the hard way:
+
+| | |
+|---|---|
+| `kernel_umount` must be **off before** the mounts are made | KernelSU unmounts module mounts "when not needed" — it silently wiped all 10 a few minutes after boot. Turning the feature off afterwards is too late. |
+| `selinux_hide` closes the Permissive tell | KernelSU's own feature: it sanitises `/sys/fs/selinux` **for app UIDs**, so a game reads Enforcing while root still sees the truth. `setenforce` cannot do this (it hangs the image). |
+| the script must be idempotent per boot | KernelSU can invoke `service.sh` once per stage; without a `boot_id` guard the log doubles and every mount is redone. |
+
+`mumu_stealth_scan` grades SELinux from the app's angle, not its own: with `selinux_hide` on it reports
+`Permissive (hidden from apps)` as **clean**, because a scan running as root would otherwise call a
+solved problem unfixable.
+
+Final state on this image:
+
+```
+clean:      properties, vendor_markers, sensor_count, loaded_modules, su_binary,
+            selinux, dmi, cpuinfo, clocksource, block_devices        (10)
+leak:       root_dirs, adbd_privilege                                (2, fixable)
+unfixable:  uname -r                                                 (1)
+```
 
 ### Kernel input channel
 
@@ -458,8 +494,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 147 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 159
+.venv\Scripts\python -m pytest -q                       # hermetic: 166 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 180
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -477,6 +513,7 @@ mumu_mcp/
   gesture.py     kernel input channel, MT-protocol-B frames, raw batching
   stealth.py     environment surface scan, property/root hiding, grading, bind-mount layer
   fakeprofile.py the ARM/DMI/clocksource content the deep layer installs
+module/        KernelSU module: reapplies everything on boot
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

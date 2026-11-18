@@ -114,16 +114,27 @@ def test_empty_expected_means_must_be_empty():
 # ---------------------------------------------------------------------------
 # sensor / kernel grading
 # ---------------------------------------------------------------------------
-def test_sensor_count_is_unfixable_when_low():
-    s, _ = _stealth({"dumpsys sensorservice 2>/dev/null | grep -cE '^[0-9]{6,}'": "1"})
+def test_sensor_count_is_unfixable_when_absent():
+    s, _ = _stealth({"dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List:/,/^$/p' "
+                     "| grep -cE '^0x[0-9a-f]{8}\\)'": "1"})
     finding = s._sensors_finding(0)
     assert finding.status == "unfixable"
     assert "sensors HAL" in finding.fix
 
 
 def test_sensor_count_clean_when_plausible():
-    s, _ = _stealth({"dumpsys sensorservice 2>/dev/null | grep -cE '^[0-9]{6,}'": "22"})
+    s, _ = _stealth({"dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List:/,/^$/p' "
+                     "| grep -cE '^0x[0-9a-f]{8}\\)'": "15"})
     assert s._sensors_finding(0).status == "clean"
+
+
+def test_sensor_count_reads_the_hex_handle_form():
+    """The first version grepped `^[0-9]{6,}` and reported 1 on an image with 15."""
+    s, adb = _stealth({"dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List:/,/^$/p' "
+                       "| grep -cE '^0x[0-9a-f]{8}\\)'": "15"})
+    s._sensors_finding(0)
+    cmd = adb.shell.call_args[0][1]
+    assert "0x[0-9a-f]{8}" in cmd, "must anchor on the hex handle, not on digits"
 
 
 def test_kernel_inconsistency_lists_each_open_tell():
@@ -154,12 +165,24 @@ def test_kernel_clean_when_cpuinfo_and_kallsyms_covered():
     assert s._kernel_finding(0).status == "clean"
 
 
-def test_selinux_permissive_is_unfixable_not_a_leak():
-    """setenforce hangs this image, so offering it as 'fixable' would be a lie."""
-    s, _ = _stealth({"getenforce": "Permissive"})
+def test_selinux_permissive_without_hide_is_a_fixable_leak():
+    """KernelSU ships `selinux_hide`, so this is fixable — not unfixable as first assumed."""
+    s, _ = _stealth({"getenforce": "Permissive",
+                     "timeout 10 /data/adb/ksu/bin/ksud feature get selinux_hide 2>/dev/null "
+                     "| grep -i '^Value' | grep -oE '[01]'": "0"})
     finding = s._selinux_finding(0)
-    assert finding.status == "unfixable"
-    assert "setenforce" in finding.fix
+    assert finding.status == "leak"
+    assert "selinux_hide" in finding.fix
+
+
+def test_selinux_permissive_with_hide_enabled_is_clean():
+    """selinux_hide only sanitises the value for app UIDs; root still reads Permissive."""
+    s, _ = _stealth({"getenforce": "Permissive",
+                     "timeout 10 /data/adb/ksu/bin/ksud feature get selinux_hide 2>/dev/null "
+                     "| grep -i '^Value' | grep -oE '[01]'": "1"})
+    finding = s._selinux_finding(0)
+    assert finding.status == "clean"
+    assert "hidden from apps" in finding.value
 
 
 def test_selinux_enforcing_is_clean():

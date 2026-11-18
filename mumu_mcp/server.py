@@ -1647,6 +1647,32 @@ def mumu_stealth_deep_restore(vmindex: int = 0) -> dict:
     return stealth().deep_restore(vmindex)
 
 
+@mcp.tool()
+@_wrap
+def mumu_stealth_features(vmindex: int = 0) -> dict:
+    """List KernelSU's kernel-side switches — where `selinux_hide` and others live.
+
+    These are neither properties nor files: they are kernel features, so nothing
+    else in this server would surface them. `selinux_hide` is the important one —
+    it makes a Permissive build read as Enforcing to app UIDs, which is the only
+    way to close that tell without taking the instance down.
+    """
+    return stealth().features(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_stealth_set_feature(vmindex: int = 0, name: str = "", enabled: bool = True) -> dict:
+    """Toggle one KernelSU feature and read it back.
+
+    `selinux_hide` sanitises `/sys/fs/selinux` for app UIDs. Note the scope: root
+    and shell still read the real value, so a scan running as root will report
+    Permissive either way — that is why `mumu_stealth_scan` checks the feature flag
+    rather than trusting its own `getenforce`.
+    """
+    return stealth().set_feature(vmindex, name, enabled)
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------

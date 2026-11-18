@@ -1,0 +1,6 @@
+id=mumu-stealth
+name=MuMu Stealth
+version=1.0.0
+versionCode=1
+author=Absurdity233
+description=Reapplies the environment/root hides on every boot: real-device properties, bind-mounted cpuinfo/DMI/kallsyms/clocksource, and KernelSU's selinux_hide. Runtime state only — nothing is written to the system image.

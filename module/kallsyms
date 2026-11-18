@@ -1,0 +1,16 @@
+ffffffff81000000 T _stext
+ffffffff81000000 T _text
+ffffffff81000100 t __cpu_setup
+ffffffff81001000 T do_one_initcall
+ffffffff81002000 T start_kernel
+ffffffff81004000 T __secondary_switched
+ffffffff81008000 T kasan_early_init
+ffffffff8100a000 T do_error_info
+ffffffff8100c000 T el0_svc
+ffffffff8100e000 T el0_svc_handler
+ffffffff81010000 T __arm64_sys_read
+ffffffff81010200 T __arm64_sys_write
+ffffffff81010400 T __arm64_sys_openat
+ffffffff81010600 T __arm64_sys_close
+ffffffff81010800 T __arm64_sys_ioctl
+ffffffff81010a00 T __arm64_sys_mmap

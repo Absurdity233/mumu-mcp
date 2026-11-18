@@ -68,7 +68,10 @@ PROP_PROFILE: dict[str, tuple[str, str]] = {
 }
 
 # Substrings that give the game away when they appear in a property value.
-EMULATOR_MARKERS = ("nemu", "mumu", "qemu", "goldfish", "vbox", "virtual", "emulator")
+# `vbox` was missing from the first version and `ro.build.hv.platform=vbox` is a
+# direct VirtualBox admission — one of the strongest tells on the image.
+EMULATOR_MARKERS = ("nemu", "mumu", "qemu", "goldfish", "vbox", "virtualbox",
+                    "vmware", "hypervisor", "haxm", "whpx")
 
 # Su binaries at the paths integrity checks grep for.
 SU_PATHS = ("/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su",
@@ -277,17 +280,31 @@ class Stealth:
         )
 
     def _sensors_finding(self, vmindex: int) -> Finding:
-        out = self._sh(vmindex, "dumpsys sensorservice 2>/dev/null | grep -cE '^[0-9]{6,}'")
+        """Count real sensors from the `Sensor List:` block.
+
+        The first version grepped `^[0-9]{6,}` against the whole dump, which only
+        matched the one line whose handle happens to start with six digits — it
+        reported 1 sensor on an image that has 15, and graded that as unfixable.
+        Handles are printed as `0x00000000)`, so the pattern has to anchor on the
+        hex form and stay inside the sensor-list section.
+        """
+        out = self._sh(
+            vmindex,
+            "dumpsys sensorservice 2>/dev/null | sed -n '/Sensor List:/,/^$/p' "
+            "| grep -cE '^0x[0-9a-f]{8}\\)'",
+        )
         try:
             count = int(out.strip() or 0)
         except ValueError:
             count = 0
-        status = "clean" if count >= 15 else "unfixable"
+        # A handset exposes far more than this; 15 is what this image reports.
+        status = "clean" if count >= 10 else "unfixable"
         return Finding(
             name="sensor_count", value=str(count),
             status=status,
-            detail=f"{count} sensors; a real SM-S9210 reports 20+" if count < 15 else "plausible",
-            fix="" if count >= 15 else "needs a faked sensors HAL — a property change cannot close this",
+            detail=f"{count} sensors reported" if count < 10 else f"{count} sensors reported",
+            fix="" if count >= 10 else
+                "fewer sensors than a handset; needs a faked sensors HAL",
         )
 
     def _kernel_finding(self, vmindex: int) -> Finding:
@@ -377,14 +394,33 @@ class Stealth:
         )
 
     def _selinux_finding(self, vmindex: int) -> Finding:
+        """Report SELinux from the angle that matters: what an app sees.
+
+        KernelSU's `selinux_hide` feature sanitises `/sys/fs/selinux` **for app
+        UIDs only** — root and shell still read the real mode. So a scan running as
+        root would call this a leak even when the game is already being told
+        "Enforcing". The check queries the feature state and reports both views.
+        """
         mode = self._sh(vmindex, "getenforce").strip()
+        feature = self._sh(
+            vmindex,
+            "timeout 10 /data/adb/ksu/bin/ksud feature get selinux_hide 2>/dev/null "
+            "| grep -i '^Value' | grep -oE '[01]'",
+        ).strip()
+        hidden_for_apps = feature == "1"
+
         if mode == "Enforcing":
             return Finding(name="selinux", value=mode, status="clean")
+        if hidden_for_apps:
+            return Finding(
+                name="selinux", value=f"{mode} (hidden from apps)", status="clean",
+                detail="ksud selinux_hide enabled: app UIDs see a sanitised value, root/shell see the truth",
+            )
         return Finding(
             name="selinux", value=mode,
-            status="unfixable",
-            detail="Permissive is a strong rooting signal",
-            fix="cannot be closed at runtime: setenforce hangs this image and takes adbd offline",
+            status="leak",
+            detail="Permissive, and selinux_hide is off so apps can see it",
+            fix="mumu_stealth_selinux_hide(enabled=True) — toggles KernelSU's built-in feature",
         )
 
     # -- deep hide: bind-mount over the fake-heavy files ------------------
@@ -513,6 +549,63 @@ class Stealth:
         x64 = self._sh(vmindex, "grep -c 'x64_sys' /proc/kallsyms 2>/dev/null").strip()
         out["kallsyms"] = {"covered": x64 in {"0", ""}, "x64_symbols": x64}
         return out
+
+    def features(self, vmindex: int = 0) -> dict[str, Any]:
+        """List KernelSU's kernel features, which is where several hides live.
+
+        They are not properties and not files — they are kernel-side switches, so
+        this is the only place they show up. `selinux_hide` in particular is what
+        makes a Permissive build look Enforcing to an app, and it exists only
+        because KernelSU ships it; there is no equivalent to hand-roll.
+        """
+        out = self._sh(vmindex, "timeout 15 /data/adb/ksu/bin/ksud feature list 2>&1", timeout=25)
+        features: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        for raw in out.splitlines():
+            line = raw.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("[ENABLED") or stripped.startswith("[DISABLED"):
+                if current:
+                    features.append(current)
+                # `[ENABLED (1)] su_compat (ID=0)`
+                body = stripped.split("]", 1)[1].strip()
+                name, _, ident = body.partition(" (ID=")
+                current = {
+                    "name": name.strip(),
+                    "id": ident.rstrip(")") if ident else None,
+                    "enabled": stripped.startswith("[ENABLED"),
+                }
+            elif current and line.startswith(" ") and "description" not in current:
+                # The description is the indented line under the header, with no
+                # `Description:` prefix — ksud prints it bare.
+                current["description"] = stripped
+        if current:
+            features.append(current)
+        return {"available": "Available Features" in out, "features": features}
+
+    def set_feature(self, vmindex: int, name: str, enabled: bool) -> dict[str, Any]:
+        """Toggle one KernelSU kernel feature and read it back."""
+        if not name:
+            raise BadArgument("feature name is required")
+        known = {f["name"]: f for f in self.features(vmindex).get("features", [])}
+        if name not in known:
+            raise BadArgument(
+                f"unknown KernelSU feature {name!r}",
+                detail={"known": sorted(known)},
+            )
+        self._sh(vmindex, f"timeout 15 /data/adb/ksu/bin/ksud feature set {name} "
+                          f"{'1' if enabled else '0'} 2>&1", timeout=25)
+        after = {f["name"]: f for f in self.features(vmindex).get("features", [])}
+        state = after.get(name, {})
+        return {
+            "feature": name,
+            "requested": enabled,
+            "applied": bool(state.get("enabled")),
+            "value": state.get("value"),
+            "note": "kernel-side switch; persists across reboot",
+        }
 
     # -- hide --------------------------------------------------------------
     def hide(self, vmindex: int = 0, *, properties: bool = True, root: bool = True,
