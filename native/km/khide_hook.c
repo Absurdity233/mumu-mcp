@@ -1271,6 +1271,110 @@ static void khide_fix_module_entries(void)
 				ARRAY_SIZE(khide_mod_props), &khide_mod_prop_count);
 	}
 }
+/* --- SCSI disk model ------------------------------------------------------ */
+
+/*
+ * `/sys/block/sdX/device/model` reads `HARDDISK` on all three disks. A handset's storage is
+ * UFS behind sdhci_msm and reports a Samsung part number, so this name is a desktop tell —
+ * and it is world-readable.
+ *
+ * This took nine attempts. What finally worked, and why the other eight did not:
+ *
+ *   - the string is not static. `sdev->model = sdev->inquiry + 16`
+ *     (drivers/scsi/scsi_scan.c), so searching .rodata for "HARDDISK" finds nothing
+ *   - `struct scsi_device` is `__randomize_layout`, so no field offset can be computed
+ *   - `kernfs_node->priv` means three different things on the three nodes that look
+ *     relevant: a disk device, an `sdev_dev`, and the literal `5`
+ *   - scanning an unknown object forward faults: a qword past the end of a slab lands in
+ *     unmapped memory, and three attempts wedged the guest that way
+ *
+ * The kernel exports the object instead:
+ *
+ *     struct Scsi_Host *scsi_host_lookup(unsigned short hostnum);
+ *     struct scsi_device *scsi_device_lookup(host, channel, id, lun);
+ *
+ * `scsi_host_lookup` takes an **integer**, not a name. Passing "host0" as a pointer made it
+ * search for host 0x3068736f and return NULL, which was the last bug.
+ *
+ * With the real `sdev` in hand, `ksize()` returns the allocation size (4096 here), and a scan
+ * bounded by it cannot leave the object. The field lands at sdev+0x100 on this build.
+ */
+static const char khide_disk_model[] = "KLUDG4UHGC-B0E1 ";
+
+static bool khide_kaddr(const void *p)
+{
+	return (unsigned long)p >= 0xffff000000000000UL &&
+	       (unsigned long)p < 0xffffffff00000000UL;
+}
+
+static bool khide_is_harddisk(const void *p)
+{
+	u64 a, b;
+
+	if (!khide_kaddr(p))
+		return false;
+	memcpy(&a, p, sizeof(a));
+	memcpy(&b, "HARDDISK", sizeof(b));
+	return a == b;
+}
+
+static unsigned int khide_disks_fixed;
+
+static void khide_fix_scsi_model(void)
+{
+	typedef void *(*host_lookup_fn)(unsigned short);
+	typedef void *(*sdev_lookup_fn)(void *, unsigned int, unsigned int, u64);
+	typedef void (*sdev_put_fn)(void *);
+	typedef size_t (*ksize_fn)(const void *);
+
+	host_lookup_fn host_lookup;
+	sdev_lookup_fn sdev_lookup;
+	sdev_put_fn sdev_put;
+	ksize_fn ksize;
+	void *shost;
+	int id;
+
+	host_lookup = (host_lookup_fn)kallsyms_lookup_name("scsi_host_lookup");
+	sdev_lookup = (sdev_lookup_fn)kallsyms_lookup_name("scsi_device_lookup");
+	sdev_put = (sdev_put_fn)kallsyms_lookup_name("scsi_device_put");
+	ksize = (ksize_fn)kallsyms_lookup_name("ksize");
+
+	if (!host_lookup || !sdev_lookup || !sdev_put || !ksize)
+		return;
+
+	shost = host_lookup(0);
+	if (!shost)
+		return;
+
+	for (id = 0; id < 4; id++) {
+		void *sdev = sdev_lookup(shost, 0, id, 0);
+		size_t size, off;
+
+		if (!sdev)
+			continue;
+
+		size = ksize(sdev);
+		if (!size || size > 0x4000) {
+			sdev_put(sdev);
+			continue;
+		}
+
+		/* Bounded by the real allocation: `off + 8 <= size` is what keeps every
+		 * read inside the object, which is the property the earlier scans lacked. */
+		for (off = 0; off + sizeof(void *) <= size; off += sizeof(void *)) {
+			void *field = *(void **)((char *)sdev + off);
+
+			if (!khide_is_harddisk(field))
+				continue;
+
+			memcpy(field, khide_disk_model, sizeof(khide_disk_model) - 1);
+			khide_disks_fixed++;
+			break;
+		}
+
+		sdev_put(sdev);
+	}
+}
 /* --- module -------------------------------------------------------------- */
 
 static int __init khide_init(void)
@@ -1285,6 +1389,7 @@ static int __init khide_init(void)
 	khide_fix_gpu();
 	khide_fix_drm();
 	khide_fix_module_entries();
+	khide_fix_scsi_model();
 	khide_fix_gpu_dev();
 	khide_fix_virtio_bus();
 	khide_fix_virtio_nodes();

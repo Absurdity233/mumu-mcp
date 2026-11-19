@@ -120,31 +120,77 @@ never looks at the parent kobject.
 kobject and then `kobj->ktype->sysfs_ops`, and a node made by `kernfs_create_dir_ns` has
 `priv == NULL`.)
 
-## Not solved
+## The block device model, and nine attempts at it
 
-Two things remain, both recorded rather than hidden:
+`/sys/block/sdX/device/model` read `HARDDISK` on all three disks. A handset's storage is UFS
+behind `sdhci_msm` and reports a Samsung part number, so the name was a desktop tell in a
+world-readable file.
 
-**Block device model.** `/sys/block/sdX/device/model` still reads `HARDDISK`. The field is
-`sdev->model` on `struct scsi_device`, reached as:
+What made it hard, in order of discovery:
 
-    sdev_show_model -> to_scsi_device(dev) -> dev_get_drvdata(dev)
+* the string is **not static**. `drivers/scsi/scsi_scan.c`:
+  `sdev->model = (char *)(sdev->inquiry + 16)` — it lives inside the device's own
+  heap-allocated INQUIRY buffer, so searching `.rodata` and then the whole kernel image both
+  found nothing.
+* `struct scsi_device` is `__randomize_layout`, so no field offset can be computed, and
+  `to_scsi_device()` is `container_of(d, struct scsi_device, sdev_gendev)` — an embedded
+  member, not `drvdata`.
+* `kernfs_node->priv` means three different things on the three nodes that look relevant:
 
-`kernfs_node->priv` is not uniformly a `struct device *` — on the SCSI target node
-`0:0:0:0` it reads `5` — so the chain has to start from the right node, and
-`struct device.driver_data` varies because the struct embeds `dev_links_info` and
-`dev_pm_info`. Six approaches were tried; two faulted the guest, four found no match.
-`struct scsi_device` is also `__randomize_layout`, so field offsets cannot be computed.
+  ```
+  /sys/block/sda                       priv = a disk device
+  /sys/class/scsi_device/0:0:0:0       priv = an sdev_dev  (priv[0] is not a name pointer)
+  storage/host0/target0:0:0/0:0:0:0    priv = 5
+  ```
 
-**Real driver code.** The `/sys/module` entries for `ufs_qcom`, `msm_drm`, `arm_smmu` and
-`sdhci_msm` are directories with attributes, not drivers. A checker that opens
+  So there was no reliable anchor.
+* scanning a guessed window past an object **faults**: a qword beyond a slab allocation lands
+  in unmapped memory, and `module_init` has no exception table. Three attempts wedged the
+  guest this way — ±0x2000 around a priv, 0x800 forward from candidates, and one unbounded
+  pass.
+
+What worked was to stop guessing and use what the kernel exports:
+
+```c
+struct Scsi_Host *scsi_host_lookup(unsigned short hostnum);
+struct scsi_device *scsi_device_lookup(host, channel, id, lun);
+size_t ksize(const void *);
+```
+
+Two details decided it:
+
+* **`scsi_host_lookup` takes an integer, not a name.** Passing `"host0"` as a pointer made it
+  search for host `0x3068736f` and return NULL — that was the last bug.
+* **`ksize()` bounds the scan.** It returns the real allocation size (4096 here), so
+  `off + 8 <= size` cannot leave the object. The field lands at `sdev + 0x100` on this build.
+
+```c
+sdev = scsi_device_lookup(shost, 0, id, 0);
+size = ksize(sdev);
+for (off = 0; off + 8 <= size; off += 8)
+        if (is_harddisk(*(void **)(sdev + off)))
+                memcpy(*(void **)(sdev + off), "KLUDG4UHGC-B0E1 ", 16);
+```
+
+Result: all three disks report `KLUDG4UHGC-B0E1`.
+
+## One thing that cannot be closed
+
+The `/sys/module` entries for `ufs_qcom`, `msm_drm`, `arm_smmu` and `sdhci_msm` are
+directories with attributes, not drivers. A checker that opens
 `/sys/module/ufs_qcom/sections/.text` sees nothing, where a handset shows a real section
-address. Closing that needs the driver compiled into the kernel, and MuMu's kernel source
-(`nemu-vbox7-source-code`, seen in the build path inside `VBoxDD.dll`) is not public.
+address.
 
-The kernel image itself was located while investigating this: `system.vdi` at offset
-`0x17c0000`, 12,362,752 bytes, uncompressed, `6.1.90-perf+ #3 SMP PREEMPT_DYNAMIC
-Fri Nov 6 09:17:00` — matching the running guest exactly. So a replacement kernel has a
-known landing site; what it cannot have is drivers that were never written.
+Closing that needs the driver compiled into the kernel. MuMu's kernel source
+(`nemu-vbox7-source-code`, seen in the build path inside `VBoxDD.dll`) is not public — but
+the kernel image itself was located while investigating this:
+
+    system.vdi at offset 0x17c0000
+    12,362,752 bytes, uncompressed bzImage
+    6.1.90-perf+ #3 SMP PREEMPT_DYNAMIC Fri Nov 6 09:17:00   (matches the guest exactly)
+
+So a replacement kernel has a known landing site; what it cannot have is drivers that were
+never written.
 ## Building it
 
 The module must match `uname -r` exactly — AOSP branch `deprecated/android14-6.1-2024-08`,
@@ -200,5 +246,10 @@ kernel-side node creation happens again each time.
 `rmmod` restores the originals — but only in a build that skips the self-hiding step, since
 the shipped one unlinks itself from the module list.
 
-The one tell still open is the block device model string; see "Not solved" above for the
-measurements behind that.
+The disks also report a Samsung UFS part rather than `HARDDISK`:
+
+```
+/sys/block/sda/device/model : KLUDG4UHGC-B0E1
+/sys/block/sdb/device/model : KLUDG4UHGC-B0E1
+/sys/block/sdc/device/model : KLUDG4UHGC-B0E1
+```
