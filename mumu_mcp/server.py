@@ -38,6 +38,7 @@ from .errors import (
 )
 from .flow import Flow, parse_steps
 from .gesture import Gestures
+from .kmod import KernelUname
 from .manager import Manager, as_list
 from .root import Root
 from .stealth import Stealth
@@ -1756,6 +1757,47 @@ def uname_daemon() -> UnameDaemon:
         inst = UnameDaemon(adb=adb(), root=root())
         _state["uname_daemon"] = inst
     return inst
+
+
+def kernel_uname() -> KernelUname:
+    inst = _state.get("kmod")
+    if inst is None:
+        inst = KernelUname(adb=adb(), root=root())
+        _state["kmod"] = inst
+    return inst
+
+
+@mcp.tool()
+@_wrap
+def mumu_kmod_status(vmindex: int = 0) -> dict:
+    """Whether the kernel-side uname module is loaded, and what uname reports now."""
+    return kernel_uname().status(vmindex)
+
+
+@mcp.tool()
+@_wrap
+def mumu_kmod_load(vmindex: int = 0, rebuild: bool = False) -> dict:
+    """Load the out-of-tree module that rewrites `init_uts_ns.name`.
+
+    This is the real fix for `uname(2)`, and it is system-wide: the module edits the single
+    struct every uname call copies from, so every process sees the fake with no per-process
+    tracer and no performance cost.
+
+    It works where the syscall-table approach could not, for a reason the 6.1.90 source
+    states outright: `sys_call_table[]` is no longer used for dispatch (`x64_sys_call()` is
+    a switch), and `init_uts_ns` is exported and lives in writable data — so no code is
+    patched and `set_memory_rw` is never called.
+
+    `rebuild` re-pushes the .ko even when the device copy exists.
+    """
+    return kernel_uname().load(vmindex, rebuild=rebuild)
+
+
+@mcp.tool()
+@_wrap
+def mumu_kmod_unload(vmindex: int = 0) -> dict:
+    """Unload the module; `uname` returns to the real kernel identity."""
+    return kernel_uname().unload(vmindex)
 
 
 @mcp.tool()

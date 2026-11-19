@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 107 tools, root, environment hiding and syscall-level uname patching, structured errors.
+used for mobile game automation and app testing. 110 tools, root, environment hiding and kernel-level uname spoofing, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -421,39 +421,87 @@ leak:       root_dirs, adbd_privilege                                (2, fixable
 unfixable:  uname_r → closeable with mumu_uname_patch                (see below)
 ```
 
-### Syscall layer — `uname(2)`
+### Kernel level — `uname(2)`
 
-`uname` was the one tell neither `resetprop` nor bind mounts could reach: it is a
-syscall, not a file. Verified — after covering `/proc/version`, `uname -r` still
-printed `6.1.90-perf+`.
+`uname` is the one tell neither `resetprop` nor a bind mount can reach: it reads a kernel
+struct, not a file. Verified — after covering `/proc/version`, `uname -r` still printed
+`6.1.90-perf+`.
 
-`native/uname_patch` is a ptrace tracer that attaches to a pid, breaks on syscall
-exit, and rewrites the `utsname` struct in the tracee. It sits below libc, so it
-works against a target that calls the syscall directly, ships its own loader, or
-clears `LD_PRELOAD`.
+**The working fix is a kernel module that rewrites `init_uts_ns.name`** — the single struct
+every `uname` copies from. System-wide, no per-process tracer, nothing bind-mounted.
+
+```python
+mumu_kmod_load()      # push + load, verify the effect
+mumu_kmod_status()    # loaded? spoofed? what does uname say now
+mumu_kmod_unload()    # restore the real identity
+```
+
+Measured across every path a check reads:
+
+```
+before: 6.1.90-perf+
+after : 6.1.75-android14-11-g4d9e0d1b2c3f
+```
+
+`uname -r`, `uname -m`, `uname -a`, `/proc/sys/kernel/osrelease`, `/proc/version`, and a
+freshly spawned shell all agree; `rmmod` restores them. The module also loads from the
+KernelSU module's `service.sh`, so it survives a reboot.
+
+Why the obvious approach cannot work, stated by the 6.1.90 source itself
+(`arch/x86/entry/syscall_64.c`):
+
+```c
+/*
+ * The sys_call_table[] is no longer used for system calls, but
+ * kernel/trace/trace_syscalls.c still wants to know the system call address.
+ */
+const sys_call_ptr_t sys_call_table[] = { ... };
+
+long x64_sys_call(const struct pt_regs *regs, unsigned int nr)
+{
+        switch (nr) { case 63: return __x64_sys_newuname(regs); ... }
+}
+```
+
+Dispatch is that `switch`. Writing `sys_call_table[63]` changes a table nothing reads —
+which is why a module that poisoned all 55 slots of `struct module` still loaded cleanly and
+did nothing. And `set_memory_rw`, needed to make that table writable, takes `cpa_lock` and
+flushes the TLB; calling it from module init wedged the guest hard enough that adb and the
+manager channel both stopped answering.
+
+`init_uts_ns` sidesteps all of it: it is exported (`__ksymtab_init_uts_ns` is in kallsyms)
+and sits past `__end_rodata` in ordinary writable data, so the module references it directly
+and writes it with a plain store.
+
+Building it is the hard part — the module must match `uname -r` exactly
+(`deprecated/android14-6.1-2024-08`, commit `ab81bbc79`), and on Windows the kernel's own
+build plumbing needs several replacements. `native/km/README.md` records every step and the
+bug that cost the most time: a `fixdep` stub that wrote to `argv[2]`, truncating every
+object file to zero bytes.
+
+### Per-process tracer — `uname(2)` without a module
+
+`native/uname_patch` attaches with ptrace, breaks on syscall exit, and rewrites the
+`utsname` in the tracee. It needs no module, so it works on a device where loading one is
+not possible. It sits below libc, so it covers a target that calls the syscall directly,
+ships its own loader, or clears `LD_PRELOAD`.
 
 ```python
 mumu_uname_selftest()        # prove it works, with a built-in target
 mumu_uname_patch(pid=...)    # attach to a real app
 mumu_uname_verify(pid=...)   # read the struct back out of /proc/<pid>/mem
 mumu_uname_detach(pid=...)   # stop (kills the tracee — see below)
+mumu_uname_daemon_start()    # attach to every matching process, keep them traced
 ```
 
-Measured end to end:
+Two costs, stated rather than discovered later: every traced thread pays a ptrace stop per
+syscall, and `PTRACE_O_EXITKILL` means killing the tracer kills the tracee (so a crashed
+tracer cannot leave a game permanently stopped).
 
-```
-before: 6.1.90-perf+|aarch64
-after : 6.1.75-android14-11-g4d9e0d1b2c3f|aarch64
-```
-
-Two costs, stated rather than discovered later: every traced thread pays a ptrace
-stop per syscall, and `PTRACE_O_EXITKILL` means killing the tracer kills the tracee
-(so a crashed tracer cannot leave a game permanently stopped).
-
-The binaries are freestanding x86-64 assembly because this host has clang but no
-Android sysroot, and the device has no headers. `native/README.md` records the three
-bugs that took — wait-status decoding (`0x2343`, not `0x7f`), `PTRACE_POKEDATA`
-argument order, and 65-byte struct padding.
+The binaries are freestanding x86-64 assembly — this host has clang but no Android sysroot,
+and the device ships no headers. `native/README.md` records the three bugs that took:
+wait-status decoding (`0x2343`, not `0x7f`), `PTRACE_POKEDATA` argument order, and 65-byte
+utsname field padding.
 
 ### Kernel input channel
 
@@ -528,8 +576,8 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 201 tests
-$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 218
+.venv\Scripts\python -m pytest -q                       # hermetic: 215 tests
+$env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 233
 .venv\Scripts\ruff check mumu_mcp tests
 ```
 
@@ -548,7 +596,8 @@ mumu_mcp/
   stealth.py     environment surface scan, property/root hiding, grading, bind-mount layer
   fakeprofile.py the ARM/DMI/clocksource content the deep layer installs
 module/        KernelSU module: reapplies everything on boot
-native/        ptrace uname tracer + LD_PRELOAD shim (freestanding asm)
+  native/        ptrace uname tracer (freestanding asm)
+  native/km/     the kernel module that fixes uname(2), and how it builds
   server.py      FastMCP tool definitions (the only file that knows about MCP)
 tests/test_units.py
 ```

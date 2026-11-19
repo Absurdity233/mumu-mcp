@@ -109,6 +109,19 @@ log "dmi covered"
 # --- hide SELinux permissive from app uids ----------------------------------
 "$KSU_BIN/ksud" feature set selinux_hide 1 2>/dev/null && log "selinux_hide on"
 
+# --- kernel-level uname spoof ------------------------------------------------
+# Loads khide_hook.ko, which rewrites init_uts_ns.name. That is the only path that reaches
+# uname(2): sys_call_table is not consulted for dispatch on this kernel (x64_sys_call is a
+# switch), so patching the table does nothing, and init_uts_ns is exported and writable, so
+# no code is patched and set_memory_rw — whose cpa_lock wedged the guest once — is never
+# called.
+#
+# Loaded here rather than in post-fs-data because the module needs the kernel's module
+# loader to be up, and service time is after that.
+KMOD=$MODDIR/khide_hook.ko
+if [ -f "$KMOD" ]; then
+  insmod "$KMOD" 2>/dev/null && log "khide_hook loaded" || log "khide_hook load failed"
+fi
 
 # --- close the root surface --------------------------------------------------
 # adbd root is a runtime state, not a persisted one; drop it here so a session
