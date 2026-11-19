@@ -1,0 +1,25 @@
+# Android shell scripts must keep LF endings.
+#
+# Git's default `autocrlf` converts them to CRLF on checkout, and Android's sh cannot parse
+# a `\r`: the module's service.sh failed with "syntax error: unexpected 'do'" and the module
+# silently did nothing at boot, while the same script ran correctly when invoked by hand
+# from a push. Pinning the endings here stops that from coming back on a fresh clone.
+*.sh            text eol=lf
+
+# Shell scripts without the extension, in the KernelSU module and native helpers.
+module/post-fs-data.sh   text eol=lf
+module/service.sh        text eol=lf
+
+# Binaries must never be touched.
+*.ko            binary
+*.so            binary
+*.png           binary
+*.jpg           binary
+
+# Python and Markdown are ordinary text; LF is fine everywhere.
+*.py            text
+*.md            text
+*.txt           text
+*.yml           text
+*.yaml          text
+*.toml          text
