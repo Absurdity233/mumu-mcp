@@ -174,12 +174,35 @@ for (off = 0; off + 8 <= size; off += 8)
 
 Result: all three disks report `KLUDG4UHGC-B0E1`.
 
-## One thing that cannot be closed
+## The module directories, closed after all
 
-The `/sys/module` entries for `ufs_qcom`, `msm_drm`, `arm_smmu` and `sdhci_msm` are
-directories with attributes, not drivers. A checker that opens
-`/sys/module/ufs_qcom/sections/.text` sees nothing, where a handset shows a real section
-address.
+An earlier version of this file said the `/sys/module` gap could not be closed. That was
+wrong, and the reason is instructive: reading a real module first showed there was nothing
+substantial to imitate.
+
+    f2fs/sections/*      = 0x0000000000000000    (kptr_restrict hides the addresses)
+    f2fs/holders/        empty
+    f2fs/notes           empty
+    f2fs/parameters/     one entry, "disabled"
+    f2fs/taint           O   (out-of-tree)
+
+So a fabricated entry reporting zeros is what a real one reports on this image. The problem
+reduced from "forge a driver's layout" to "carry the same attribute names with the same kinds
+of values", which is mechanical.
+
+The entries now match `f2fs` attribute for attribute:
+
+    coresize holders initsize initstate notes parameters refcnt
+    sections srcversion taint uevent version
+
+and `sections/` holds the same 21 names (`ls -a`; the dot-prefixed ones are hidden from a
+plain `ls`, which is what made the first count look wrong). `holders/` and `parameters/`
+exist with the expected shape.
+
+What is still different, if someone looks: `sections/*` all read zero rather than distinct
+addresses. On a build with `kptr_restrict=0` a real module shows real addresses there — but
+this image ships `kptr_restrict=2`, so real modules show zeros too. Matching the image is the
+honest target, and it is met.
 
 Closing that needs the driver compiled into the kernel. MuMu's kernel source
 (`nemu-vbox7-source-code`, seen in the build path inside `VBoxDD.dll`) is not public — but

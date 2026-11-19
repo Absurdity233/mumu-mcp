@@ -1319,15 +1319,28 @@ static bool khide_starts_with(const void *p, const char *want, size_t n)
 	return memcmp(p, want, n) == 0;
 }
 
-/* The three INQUIRY strings sit at fixed offsets inside the device buffer:
- *   vendor @ +8 (8 bytes), model @ +16 (16), revision @ +32 (4)
- * Rewriting them in place is enough because `sdev->vendor`, `sdev->model` and `sdev->rev`
- * are pointers into that same buffer, and it is kmalloc memory — no page attribute change. */
-static void khide_fix_inquiry(char *inq)
+/* INQUIRY buffer layout, from drivers/scsi/scsi_scan.c:
+ *     sdev->vendor = inquiry + 8    (8 bytes)
+ *     sdev->model  = inquiry + 16   (16 bytes)
+ *     sdev->rev    = inquiry + 32   (4 bytes)
+ *
+ * The pointer that matched during the scan is one of those three *fields' values*, i.e. it
+ * already points at its own slot inside the buffer — not at the buffer start. Treating it
+ * as the start (the previous version did) shifted every write by the offset of whichever
+ * slot matched, which produced "SAMSUNGKLUDG4UH": the vendor string landing in the model
+ * slot.
+ *
+ * So the base is recovered by subtracting the slot's own offset, and all three strings are
+ * written from there. */
+#define KHIDE_INQ_VENDOR_OFF 8
+#define KHIDE_INQ_MODEL_OFF  16
+#define KHIDE_INQ_REV_OFF    32
+
+static void khide_fix_inquiry(char *inquiry_base)
 {
-	memcpy(inq + 8,  khide_disk_vendor, 8);
-	memcpy(inq + 16, khide_disk_model, 16);
-	memcpy(inq + 32, khide_disk_rev, 4);
+	memcpy(inquiry_base + KHIDE_INQ_VENDOR_OFF, khide_disk_vendor, 8);
+	memcpy(inquiry_base + KHIDE_INQ_MODEL_OFF,  khide_disk_model, 16);
+	memcpy(inquiry_base + KHIDE_INQ_REV_OFF,    khide_disk_rev, 4);
 }
 
 static unsigned int khide_disks_fixed;
@@ -1378,18 +1391,175 @@ static void khide_fix_scsi_model(void)
 		 * model rewritten still gets its vendor fixed — `vendor=VBOX` is the more
 		 * direct giveaway of the two. */
 		for (off = 0; off + sizeof(void *) <= size; off += sizeof(void *)) {
-			void *field = *(void **)((char *)sdev + off);
+			char *field = *(char **)((char *)sdev + off);
+			char *base;
 
-			if (!khide_starts_with(field, "HARDDISK", 8) &&
-			    !khide_starts_with(field, "VBOX", 4))
+			/* Recover the buffer start from whichever slot matched. The three
+			 * starts are told apart by content, which is exactly what was
+			 * compared.
+			 *
+			 * "SAMSUNG" is matched as well so a device whose vendor was already
+			 * rewritten still has its model and revision corrected. */
+			if (khide_starts_with(field, "HARDDISK", 8))
+				base = field - KHIDE_INQ_MODEL_OFF;
+			else if (khide_starts_with(field, "VBOX", 4))
+				base = field - KHIDE_INQ_VENDOR_OFF;
+			else if (khide_starts_with(field, "SAMSUNG", 7))
+				base = field - KHIDE_INQ_VENDOR_OFF;
+			else
 				continue;
 
-			khide_fix_inquiry((char *)field);
+			khide_fix_inquiry(base);
 			khide_disks_fixed++;
 			break;
 		}
 
 		sdev_put(sdev);
+	}
+}
+/* --- complete the fabricated module directories --------------------------- */
+
+/*
+ * The Qualcomm entries created above had only coresize, initsize, refcnt and srcversion. A
+ * real module on this image also has
+ *
+ *     holders/  initstate  notes  parameters/  sections/  taint  uevent  version
+ *
+ * Reading a real one first made the gap far cheaper to close than expected:
+ *
+ *     f2fs/sections/*      = 0x0000000000000000     (kptr_restrict hides the addresses)
+ *     f2fs/holders/        empty
+ *     f2fs/notes           empty
+ *     f2fs/parameters/     one entry, "disabled"
+ *
+ * So there is no genuine section address to imitate — a fabricated entry reporting zeros is
+ * what a real one reports on this image. The problem reduces from "forge a driver's layout"
+ * to "add the same attributes carrying the same kinds of values".
+ *
+ * The section list is copied from `ls -a /sys/module/f2fs/sections/`, which has 21 entries;
+ * that module is a driver built into the image, so it is the right template.
+ */
+static const char v_mod_initstate[] = "live\n";
+static const char v_mod_empty[] = "0x0000000000000000\n";
+static const char v_mod_param[] = "0\n";
+
+/* The plain attributes a real module carries besides the ones already created
+ * (`coresize`, `initsize`, `refcnt`, `srcversion`). `taint` is empty for an in-tree module,
+ * which is what these pretend to be; `version` and `uevent` are empty on this image too. */
+static const char v_mod_taint[]   = "";
+static const char v_mod_version[] = "";
+static const char v_mod_uevent[]  = "";
+
+static struct khide_kprop khide_mod_extra[] = {
+	{ .name = "initstate", .value = v_mod_initstate, .len = 11 },
+	{ .name = "taint",     .value = v_mod_taint,     .len = 1 },
+	{ .name = "version",   .value = v_mod_version,   .len = 1 },
+	{ .name = "uevent",    .value = v_mod_uevent,    .len = 1 },
+};
+
+static const char * const khide_mod_sections[] = {
+	".text", ".data", ".rodata", ".bss",
+	".init.text", ".init.data", ".exit.text", ".exit.data",
+	".rodata.str1.1", ".note.Linux", ".note.gnu.build-id",
+	".gnu.linkonce.this_module",
+	".smp_locks", ".retpoline_sites", ".return_sites",
+	".static_call_sites", ".strtab", ".symtab",
+	"__bug_table", "__mcount_loc", "__param",
+};
+
+static const char * const khide_mod_params[] = { "enabled", "debug" };
+
+static unsigned int khide_mod_extra_added;
+
+static void khide_add_one(struct kernfs_node *dir, const char *name,
+			  const char *value, size_t len)
+{
+	typedef struct kernfs_node *(*kmkdir_fn)(struct kernfs_node *, const char *,
+						 umode_t, kuid_t, kgid_t, void *,
+						 const void *);
+	struct khide_kprop *p;
+	kmkdir_fn mkdir;
+
+	if (!dir || !name || !value || !len)
+		return;
+
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return;
+
+	p->name = name;
+	p->value = value;
+	p->len = len;
+	khide_add_props(dir, p, 1, &khide_mod_extra_added);
+	kfree(p);
+
+	(void)mkdir;
+}
+
+static void khide_fix_module_attrs(void)
+{
+	typedef struct kernfs_node *(*kfind_fn)(struct kernfs_node *, const char *,
+						const void *);
+	typedef struct kernfs_node *(*kmkdir_fn)(struct kernfs_node *, const char *,
+						 umode_t, kuid_t, kgid_t, void *,
+						 const void *);
+	kfind_fn find;
+	kmkdir_fn mkdir;
+	struct kernfs_node *fw_sd, *sys_sd, *mod_sd, *dir;
+	size_t i, j;
+
+	fw_sd = firmware_kobj ? firmware_kobj->sd : NULL;
+	if (!fw_sd)
+		return;
+
+	find = (kfind_fn)kallsyms_lookup_name("kernfs_find_and_get_ns");
+	mkdir = (kmkdir_fn)kallsyms_lookup_name("kernfs_create_dir_ns");
+	if (!find || !mkdir)
+		return;
+
+	sys_sd = *(struct kernfs_node **)((char *)fw_sd + 0x08);
+	if (!sys_sd || (unsigned long)sys_sd < 0xffff000000000000UL)
+		return;
+
+	mod_sd = find(sys_sd, "module", NULL);
+	if (!mod_sd)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(khide_qualcomm_modules); i++) {
+		struct kernfs_node *holders, *sections, *params;
+
+		dir = find(mod_sd, khide_qualcomm_modules[i], NULL);
+		if (!dir)
+			continue;
+
+		khide_add_props(dir, khide_mod_extra,
+				ARRAY_SIZE(khide_mod_extra), &khide_mod_extra_added);
+		khide_add_one(dir, "notes", v_mod_param, 1);
+
+		holders = find(dir, "holders", NULL);
+		if (!holders)
+			mkdir(dir, "holders", 0755, GLOBAL_ROOT_UID,
+			      GLOBAL_ROOT_GID, NULL, NULL);
+
+		sections = find(dir, "sections", NULL);
+		if (!sections)
+			sections = mkdir(dir, "sections", 0755, GLOBAL_ROOT_UID,
+					 GLOBAL_ROOT_GID, NULL, NULL);
+		if (sections && !IS_ERR(sections)) {
+			for (j = 0; j < ARRAY_SIZE(khide_mod_sections); j++)
+				khide_add_one(sections, khide_mod_sections[j],
+					      v_mod_empty, sizeof(v_mod_empty) - 1);
+		}
+
+		params = find(dir, "parameters", NULL);
+		if (!params)
+			params = mkdir(dir, "parameters", 0755, GLOBAL_ROOT_UID,
+				       GLOBAL_ROOT_GID, NULL, NULL);
+		if (params && !IS_ERR(params)) {
+			for (j = 0; j < ARRAY_SIZE(khide_mod_params); j++)
+				khide_add_one(params, khide_mod_params[j],
+					      v_mod_param, sizeof(v_mod_param) - 1);
+		}
 	}
 }
 /* --- module -------------------------------------------------------------- */
@@ -1406,6 +1576,7 @@ static int __init khide_init(void)
 	khide_fix_gpu();
 	khide_fix_drm();
 	khide_fix_module_entries();
+	khide_fix_module_attrs();
 	khide_fix_scsi_model();
 	khide_fix_gpu_dev();
 	khide_fix_virtio_bus();

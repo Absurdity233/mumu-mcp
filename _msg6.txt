@@ -1,0 +1,43 @@
+feat(kmod): complete the fabricated module directories, closing the last structural gap
+
+An earlier README section said this could not be closed. That was wrong, and reading a real
+module first shows why: there is nothing substantial to imitate.
+
+    f2fs/sections/*      = 0x0000000000000000   (kptr_restrict hides the addresses)
+    f2fs/holders/        empty
+    f2fs/notes           empty
+    f2fs/parameters/     one entry, "disabled"
+    f2fs/taint           O  (out-of-tree)
+
+So on this image a fabricated entry reporting zeros is indistinguishable from a real one.
+The problem reduced from "forge a driver's layout" to "carry the same attribute names with
+the same kinds of values".
+
+The Qualcomm directories now match f2fs attribute for attribute:
+
+    coresize holders initsize initstate notes parameters refcnt
+    sections srcversion taint uevent version
+
+and sections/ holds the same 21 names. The first count looked wrong because a plain `ls`
+hides the dot-prefixed entries; `ls -a` shows all 21 on both.
+
+Also fixed in this pass:
+
+- the SCSI vendor, alongside the model. Both live in the same INQUIRY buffer, 8 bytes apart.
+  The pointer that matches during the scan is the field's own value, so treating it as the
+  buffer start shifted every write — the first attempt produced
+  vendor=[VBOX] model=[SAMSUNGKLUDG4UH], the vendor string landing in the model slot. The
+  base is now recovered by subtracting the slot offset.
+
+Verified from the shell uid after a reboot:
+
+    /sys/block/sdX/device/vendor : SAMSUNG
+    /sys/block/sdX/device/model  : KLUDG4UHGC-B0E1
+    /sys/module/ufs_qcom         : 12 attributes, sections/ with 21 entries
+    dmesg, /proc/cmdline, /proc/kallsyms : refused to an unprivileged reader
+    /sys/bus/virtio, virtio device nodes : absent
+    su, /data/adb, magisk                : not reachable
+
+The kernel image was also located while investigating: system.vdi at offset 0x17c0000,
+12,362,752 bytes, uncompressed, version matching the guest exactly — recorded in
+native/km/README.md so the finding is not lost.
