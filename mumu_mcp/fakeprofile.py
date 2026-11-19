@@ -118,4 +118,10 @@ STAGE_DIR = "/data/local/tmp/.mumu_stealth"
 OSRELEASE = "6.1.75-android14-11-g4d9e0d1b2c3f"
 
 # The ARM `uname -m` value a real handset reports.
-MACHINE = "aarch64"
+# `uname -m` must agree with the ELF headers, because that is the cheapest cross-check
+# there is. Every userspace binary on this image is EM_X86_64 (e_machine 0x3e) —
+# /system/bin/sh, toybox, app_process64, linker64, libc.so, libm.so all confirm it. The
+# stock kernel says aarch64 because MuMu patches it, so reporting aarch64 only creates a
+# contradiction with every binary on the system: one read of an ELF header is a stronger
+# signal than any faked value. Report what the userspace actually is.
+MACHINE = "x86_64"

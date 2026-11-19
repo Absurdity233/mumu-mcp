@@ -49,18 +49,45 @@ def test_scripts_are_idempotent_per_boot():
         assert "exit 0" in text
 
 
-def test_service_covers_every_file_the_deep_layer_covers():
+def test_service_loads_the_kernel_module():
+    """The hiding lives in khide_hook.ko now, not in mounts."""
     text = (MODULE / "service.sh").read_text(encoding="utf-8")
-    for target in ("/proc/cpuinfo", "/proc/kallsyms", "/proc/sys/kernel/osrelease",
-                   "/sys/devices/system/clocksource/clocksource0/current_clocksource",
-                   "/sys/devices/system/clocksource/clocksource0/available_clocksource"):
-        assert target in text, f"service.sh does not cover {target}"
+    assert "khide_hook.ko" in text
+    assert "insmod" in text
 
 
-def test_service_covers_dmi_fields():
+def test_module_ships_the_kernel_module():
+    ko = MODULE / "khide_hook.ko"
+    assert ko.is_file() and ko.stat().st_size > 1000
+    assert ko.read_bytes()[:4] == b"\x7fELF"
+
+
+def test_service_no_longer_bind_mounts():
+    """A bind mount shows up in /proc/self/mounts, which any process can read.
+
+    On real hardware /proc/cpuinfo comes from procfs and /sys/class/dmi/id/* from sysfs,
+    so an ext4 partition as the mount source is a bigger tell than the value it hides.
+    The kernel module replaced all of it; a mount left dormant here would reintroduce the
+    tell on some future boot.
+    """
     text = (MODULE / "service.sh").read_text(encoding="utf-8")
-    assert "/sys/class/dmi/id/" in text
-    assert "sys_vendor" in text
+    # Ignore comments — the rationale above is spelled out there.
+    code = "\n".join(
+        ln for ln in text.splitlines() if not ln.strip().startswith("#")
+    )
+    assert "mount --bind" not in code
+    assert "/proc/cpuinfo" not in code
+    assert "/sys/class/dmi/id/" not in code
+    assert "clocksource0" not in code
+
+
+def test_staged_data_files_are_gone():
+    """The files those mounts needed must not linger."""
+    for name in ("cpuinfo", "kallsyms", "osrelease", "dmi.prop"):
+        assert not (MODULE / name).exists(), (
+            f"{name} is left over from the bind-mount layer; the kernel module "
+            "sets these values directly"
+        )
 
 
 def test_service_deletes_vendor_properties():
@@ -74,26 +101,16 @@ def test_service_enables_selinux_hide():
     assert "selinux_hide" in text
 
 
-def test_data_files_are_present_and_non_empty():
-    for name in ("cpuinfo", "kallsyms", "osrelease", "dmi.prop"):
-        path = MODULE / name
-        assert path.is_file() and path.stat().st_size > 0, name
+def test_scripts_have_no_crlf():
+    """Android's sh cannot parse `\\r`; a CRLF script fails at boot with a syntax error.
 
-
-def test_cpuinfo_data_is_arm():
-    text = (MODULE / "cpuinfo").read_text(encoding="utf-8")
-    assert "CPU implementer" in text and "AuthenticAMD" not in text
-
-
-def test_dmi_prop_has_no_virtualbox():
-    text = (MODULE / "dmi.prop").read_text(encoding="utf-8").lower()
-    for marker in ("innotek", "vbox", "virtualbox"):
-        assert marker not in text
-
-
-def test_kallsyms_data_has_no_x86_symbols():
-    text = (MODULE / "kallsyms").read_text(encoding="utf-8")
-    assert "x64_sys" not in text
+    This is not hypothetical: service.sh was written with Windows line endings and the
+    module silently did nothing on reboot, while `sh -n` on the device reported
+    "syntax error: unexpected 'do'".
+    """
+    for name in ("service.sh", "post-fs-data.sh"):
+        data = (MODULE / name).read_bytes()
+        assert b"\r\n" not in data, f"{name} has CRLF line endings"
 
 
 @pytest.mark.skipif(shutil.which("sh") is None and os.name == "nt", reason="no POSIX shell")
@@ -194,11 +211,21 @@ def test_live_module_is_installed_and_applied():
     assert "mumu-stealth" in listing
     assert '"enabled": "true"' in listing
 
-    if "CPU implementer" not in adb.shell(0, "grep -m1 'CPU implementer' /proc/cpuinfo"):
-        # mounts were reset; reapply so the rest of the assertions are meaningful
+    # The module loads khide_hook.ko, which hides itself — `lsmod` deliberately does not
+    # list it, so the observable proof is the values it changed.
+    release = adb.shell(0, "uname -r").strip()
+    if not release.startswith("6.1.75-"):
         adb.shell(0, "rm -f /data/adb/modules/mumu-stealth/.last_boot; "
                      "timeout 40 sh /data/adb/modules/mumu-stealth/service.sh 2>&1")
 
-    assert "CPU implementer" in adb.shell(0, "grep -m1 'CPU implementer' /proc/cpuinfo")
+    release = adb.shell(0, "uname -r").strip()
+    assert release.startswith("6.1.75-"), release
+
+    # No bind mount may be involved: an override shows up in /proc/self/mounts, which any
+    # process can read, and a real device serves these from procfs/sysfs.
+    overrides = adb.shell(
+        0, "grep -cE 'proc/cpuinfo|proc/kallsyms|clocksource|dmi/id' /proc/mounts").strip()
+    assert overrides == "0", f"{overrides} bind-mount override(s) still present"
+
     assert "innotek" not in adb.shell(0, "cat /sys/class/dmi/id/sys_vendor")
-    assert adb.shell(0, "grep -c x64_sys /proc/kallsyms").strip() == "0"
+    assert "hypervisor" not in adb.shell(0, "grep -m1 '^flags' /proc/cpuinfo")

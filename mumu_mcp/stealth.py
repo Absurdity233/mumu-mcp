@@ -166,7 +166,58 @@ class Stealth:
         scan.findings.append(self._cpuinfo_finding(vmindex))
         scan.findings.append(self._clocksource_finding(vmindex))
         scan.findings.append(self._blockdev_finding(vmindex))
+        scan.findings.append(self._mounts_finding(vmindex))
         return scan
+
+    def _mounts_finding(self, vmindex: int) -> Finding:
+        """Whether the overrides are themselves visible in the mount table.
+
+        A bind mount changes what a read returns, but it also adds a line to
+        `/proc/self/mounts`, and every process can read that file. On real hardware
+        `/proc/cpuinfo`, `/proc/kallsyms` and `/sys/class/dmi/id/*` come from procfs and
+        sysfs; a detector that sees them backed by an ext4 partition has found the
+        overrides without reading a single faked value.
+
+        This is graded separately from the overrides themselves, because a surface can be
+        perfectly faked and still give itself away here.
+        """
+        from . import fakeprofile as fp
+
+        expected = {
+            fp.OVERRIDES["cpuinfo"],
+            fp.OVERRIDES["kallsyms"],
+            fp.OVERRIDES["osrelease"],
+            fp.OVERRIDES["clocksource_current"],
+            fp.OVERRIDES["clocksource_available"],
+        }
+        expected.update(f"{fp.DMI_DIR}/{k}" for k in fp.DMI)
+
+        out = self._sh(vmindex, "cat /proc/self/mounts 2>/dev/null")
+        exposed: list[str] = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            source, target = parts[0], parts[1]
+            if target not in expected:
+                continue
+            # procfs/sysfs targets are legitimate; anything else on /proc or /sys is not.
+            if source in ("proc", "sysfs", "tmpfs"):
+                continue
+            exposed.append(f"{target} from {source}")
+
+        if not exposed:
+            return Finding(
+                name="mounts", value="no override visible", status="clean",
+                detail="every /proc and /sys path that matters is served by its own fs",
+            )
+        return Finding(
+            name="mounts", value=f"{len(exposed)} override(s) visible", status="unfixable",
+            detail="; ".join(exposed[:4]),
+            fix=("bind mounts cannot hide themselves: a real device serves these from procfs "
+                 "and sysfs, so the mount table alone betrays them. Only a kernel-side "
+                 "implementation (like mumu_kmod_load does for uname) avoids this"),
+        )
 
     def _dmi_finding(self, vmindex: int) -> Finding:
         """DMI is the strongest VM tell on this image: `innotek GmbH` is VirtualBox."""
@@ -190,19 +241,45 @@ class Stealth:
         )
 
     def _cpuinfo_finding(self, vmindex: int) -> Finding:
-        """`vendor_id : AuthenticAMD` under `uname -m = aarch64` cannot both be true."""
-        from . import fakeprofile as fp
+        """Whether `/proc/cpuinfo` gives the emulator away.
 
-        real = self._sh(vmindex, f"head -20 {fp.OVERRIDES['cpuinfo']} 2>&1")
-        covered = "CPU implementer" in real and "AuthenticAMD" not in real
-        if covered:
-            return Finding("cpuinfo", "ARM profile", "clean")
-        x86 = "AuthenticAMD" in real or "vendor_id" in real
+        The first version of this check looked for `vendor_id: AuthenticAMD` under
+        `uname -m = aarch64` and called that the contradiction. That was backwards: every
+        userspace binary on this image is EM_X86_64, so an aarch64 `uname -m` was itself
+        the tell, and rewriting `/proc/cpuinfo` to look ARM-shaped would only have added a
+        second contradiction.
+
+        What actually matters is the virtualisation evidence inside cpuinfo:
+        the `hypervisor` flag and the host CPU model string. Both are cleared in the
+        kernel data by `mumu_kmod_load`.
+        """
+        out = self._sh(vmindex, "head -30 /proc/cpuinfo 2>&1")
+
+        machines = []
+        if "hypervisor" in out:
+            machines.append("hypervisor flag")
+        if "vmmcall" in out:
+            machines.append("vmmcall flag")
+        host_cpu = ""
+        for line in out.splitlines():
+            if line.startswith("model name"):
+                host_cpu = line.split(":", 1)[1].strip()
+                break
+        # A handset never reports a desktop part.
+        for marker in ("Ryzen", "Core i", "Xeon", "Pentium", "Atom", "EPYC"):
+            if marker in host_cpu:
+                machines.append(f"host cpu: {host_cpu[:40]}")
+                break
+
+        if machines:
+            return Finding(
+                name="cpuinfo", value="virtualisation visible", status="leak",
+                detail="; ".join(machines),
+                fix="mumu_kmod_load() clears the flags and the model string in kernel data",
+            )
         return Finding(
-            name="cpuinfo", value="x86 on aarch64" if x86 else "unknown",
-            status="leak" if x86 else "clean",
-            detail="vendor_id: AuthenticAMD while uname -m says aarch64" if x86 else "",
-            fix="mumu_stealth_deep(cpuinfo=True)" if x86 else "",
+            name="cpuinfo", value=host_cpu[:32] or "clean", status="clean",
+            detail="no hypervisor/vmmcall flag, no desktop CPU model",
         )
 
     def _clocksource_finding(self, vmindex: int) -> Finding:
@@ -267,9 +344,16 @@ class Stealth:
         for key, value in props.items():
             if not value:
                 continue
-            low = f"{key}={value}".lower()
+            # The marker must appear as a whole segment of the key, either exactly or as
+            # a prefix of one — `nemud.fps_limit` and `init.svc.nemuhotd` both count.
+            # A plain substring test on the whole key was wrong in the other direction:
+            # it matched a random 48-character property name that happened to end in
+            # "nemu" (vnwbcgrwsfcnfrfiwirhnsixobizfjrfpfndayjogjxnemu) and reported a
+            # clean surface as a leak.
+            segments = key.lower().replace("-", ".").replace("_", ".").split(".")
             for marker in EMULATOR_MARKERS:
-                if marker in low:
+                if any(seg == marker or seg.startswith(marker) for seg in segments) \
+                        or marker in value.lower():
                     hits.append(f"{key}={value}")
                     break
         status = "leak" if hits else "clean"
@@ -321,12 +405,18 @@ class Stealth:
         kallsyms = "x64_sys" in self._sh(vmindex, "grep -m1 init_module /proc/kallsyms 2>/dev/null")
 
         open_tells: list[str] = []
-        if "AuthenticAMD" in cpu or "vendor_id" in cpu:
-            open_tells.append("cpuinfo says x86")
+        is_x86 = uname_m in ("x86_64", "i686", "i386")
+
+        # `vendor_id` and `__x64_sys_*` are only contradictions when `uname -m` claims
+        # something else. Every userspace binary here is EM_X86_64, so an x86 kernel
+        # identity is the *consistent* answer and flagging it would push towards a fake
+        # that contradicts the ELF headers instead.
+        if not is_x86 and ("AuthenticAMD" in cpu or "vendor_id" in cpu):
+            open_tells.append(f"cpuinfo says x86 while uname -m is {uname_m}")
         if hypervisor:
             open_tells.append("cpuinfo has the hypervisor flag")
-        if kallsyms:
-            open_tells.append("kallsyms exposes __x64_sys_*")
+        if not is_x86 and kallsyms:
+            open_tells.append(f"kallsyms exposes __x64_sys_* while uname -m is {uname_m}")
         if "perf+" in uname_r or "android" not in uname_r.lower():
             open_tells.append(f"uname -r is {uname_r!r} (a handset reports -android)")
 
@@ -372,25 +462,70 @@ class Stealth:
         )
 
     def _rootfs_finding(self, vmindex: int) -> Finding:
-        found = [p for p in ROOT_PATHS if "No such" not in self._sh(vmindex, f"ls {p} 2>&1")]
+        """Whether the root directories are visible to something that is *not* root.
+
+        Running `ls` as root and calling a hit a leak gets this backwards: on a correctly
+        locked-down image `/data/adb` is mode 700 root:root, so `ls /data/adb/ksu` as root
+        succeeds and the scan reports a leak that no app can see. What matters is the
+        permission on the parent and whether a non-root reader is refused — which is
+        exactly what `ls` reports as "Permission denied".
+        """
+        visible: list[str] = []
+        for p in ROOT_PATHS:
+            out = self._sh(vmindex, f"ls {p} >/dev/null 2>&1; echo rc=$?").strip()
+            # rc=0 means it listed; "Permission denied" or "No such" both mean hidden.
+            if "rc=0" in out:
+                visible.append(p)
+
+        # The parent directory's mode decides whether anything below is reachable at all.
+        mode = self._sh(
+            vmindex,
+            "stat -c '%a %U:%G' /data/adb 2>/dev/null").strip()
+        locked = mode.startswith("700")
+
+        if not visible or locked:
+            return Finding(
+                name="root_dirs",
+                value="not readable" if locked else "hidden",
+                status="clean",
+                detail=f"/data/adb is {mode}" if mode else "",
+            )
         return Finding(
-            name="root_dirs", value=f"{len(found)} present",
-            status="leak" if found else "clean",
-            detail=", ".join(found),
-            fix="mumu_stealth_hide(root=True)" if found else "",
+            name="root_dirs", value=f"{len(visible)} readable",
+            status="leak", detail=", ".join(visible),
+            fix="mumu_stealth_hide(root=True)",
         )
 
     def _debug_finding(self, vmindex: int) -> Finding:
+        """Whether *an app* would see a root-capable adb.
+
+        The check runs `id` in the current adb session, so with root enabled it reports
+        root and calls that a leak — but that is the operator's own shell, not something a
+        game can read. What a detector can actually observe is that adb accepted a root
+        request at all, which `ro.debuggable` and `ro.secure` describe, plus the fact that
+        a fresh non-root connection lands as `shell`.
+        """
         debuggable = self._getprop(vmindex, "ro.debuggable")
-        adb_root = self._sh(vmindex, "id").strip()
-        is_root_adbd = "uid=0" in adb_root
-        # adbd as root is the one that actually matters: a game can read it.
-        status = "leak" if is_root_adbd else "clean"
+        secure = self._getprop(vmindex, "ro.secure")
+        session_uid = self._sh(vmindex, "id").strip()
+        session_root = "uid=0" in session_uid
+
+        # A handset ships ro.debuggable=0 and ro.secure=1; whatever the current session
+        # happens to be is not something a third-party app can query.
+        leaked = debuggable not in ("0", "") or secure == "0"
+        if not leaked:
+            return Finding(
+                name="adbd_privilege",
+                value="root session (operator only)" if session_root else "shell",
+                status="clean",
+                detail=f"ro.debuggable={debuggable} ro.secure={secure}; "
+                       "an app cannot read the adb session's uid",
+            )
         return Finding(
-            name="adbd_privilege", value="root" if is_root_adbd else "shell",
-            status=status, detail=f"ro.debuggable={debuggable}",
-            fix="mumu_root_adb(enabled=False) before shipping, or mumu_stealth_hide(root=True)"
-                if is_root_adbd else "",
+            name="adbd_privilege", value=f"debuggable={debuggable} secure={secure}",
+            status="leak",
+            detail="a device that reports ro.debuggable=1 is shipping an eng build",
+            fix="resetprop ro.debuggable 0; resetprop ro.secure 1",
         )
 
     def _selinux_finding(self, vmindex: int) -> Finding:

@@ -1,115 +1,133 @@
-# native/km — the kernel module that fixes `uname(2)`
+# native/km — the kernel module that hides the emulator surface
 
-`khide_hook.ko` rewrites `init_uts_ns.name`, the single struct every `uname(2)` copies from.
-Loading it makes `uname -r` report a handset kernel for every process on the system, with
-no per-process tracer and no performance cost. Unloading restores the real identity.
+`khide_hook.ko` rewrites kernel data so the emulator and root surface disappear, with **no
+bind mounts at all**. Everything is set where the kernel keeps it, so nothing appears in
+`/proc/self/mounts`.
 
-## Why this is the only thing that works
+## Why bind mounts had to go
 
-Three approaches failed first, and the 6.1.90 source says why each one had to fail.
-
-**The syscall table is not used.** `arch/x86/entry/syscall_64.c`:
-
-```c
-/*
- * The sys_call_table[] is no longer used for system calls, but
- * kernel/trace/trace_syscalls.c still wants to know the system
- * call address.
- */
-const sys_call_ptr_t sys_call_table[] = { ... };
-
-long x64_sys_call(const struct pt_regs *regs, unsigned int nr)
-{
-        switch (nr) { case 63: return __x64_sys_newuname(regs); ... }
-}
-```
-
-Dispatch is that `switch`, called from `arch/x86/entry/common.c`. Writing
-`sys_call_table[63]` changes a table nothing reads — which is why the module that poisoned
-all 55 slots of `struct module` still loaded cleanly and changed nothing.
-
-**`uname` is number 63 and its handler is `newuname`.** `arch/x86/entry/syscalls/syscall_64.tbl`:
+An earlier version covered `/proc/cpuinfo`, `/proc/kallsyms`, the clocksource files and the
+eight DMI attributes with `mount --bind`. The values were right, and it still gave itself
+away:
 
 ```
-63	common	uname			sys_newuname
+/dev/block/sdc3 /proc/cpuinfo ext4 rw,seclabel,noatime 0 0
+/dev/block/sdc3 /sys/class/dmi/id/sys_vendor ext4 rw,seclabel,noatime 0 0
 ```
 
-Confirmed at runtime with two kprobes: three `uname` calls hit `__x64_sys_newuname` three
-times and `__x64_sys_uname` zero times.
+On real hardware those files come from procfs and sysfs. An ext4 partition as the mount
+source is a stronger signal than any value being hidden, and every process can read
+`/proc/mounts`.
 
-**Patching code needs a lock that deadlocks.** `set_memory_rw` calls
-`change_page_attr_set`, which takes `cpa_lock` and does a global TLB flush; calling it from
-module init wedged the guest so completely that adb and the manager channel both stopped
-answering.
+## What it fixes, and where that data lives
 
-None of that matters here, because the data is already writable:
+| item | kernel data | how it is reached |
+|---|---|---|
+| `uname -r`, `uname -m` | `init_uts_ns.name` | exported symbol |
+| clocksource | `curr_clocksource->name` | kallsyms |
+| DMI identity | `dmi_ident[]` | kallsyms |
+| cpuinfo | per-cpu `cpuinfo_x86` | kallsyms + `per_cpu_ptr` |
+| the module itself | global `modules` list + sysfs | `list_del` + `mod_sysfs_teardown` |
+
+`kallsyms_lookup_name` is one of the 12012 symbols this kernel exports, so nothing is baked
+in — a KASLR reshuffle at every boot changes nothing.
+
+## Measured offsets, not assumed ones
+
+Two wrong guesses each cost a wedged guest, so every offset below was read out of the live
+kernel before being written to.
+
+**`struct clocksource` — `name` is at 0x30, not 0.** The struct begins with the `read`
+function pointer. Writing a string at offset 0 replaced that pointer with text; the kernel
+then called into it while taking a timestamp and the guest stopped answering:
 
 ```
-__start_rodata = 0xffffffff8a000000
-__end_rodata   = 0xffffffff8a494000
-init_uts_ns    = 0xffffffff8a7b43d0   <- past rodata, ordinary .data
+read(8) mask(8) mult(4) shift(4) max_idle_ns(8) maxadj(4)
+uncertainty_margin(4) max_cycles(8) -> name @ 0x30
 ```
 
-And `init_uts_ns` is one of the 12012 symbols the kernel exports
-(`__ksymtab_init_uts_ns` is in kallsyms), so the module references it directly — no address
-patching, no kallsyms lookup, nothing that changes per boot.
+(`CONFIG_ARCH_CLOCKSOURCE_DATA` is unset, so `archdata` is absent and the offset is fixed.)
+
+**`struct cpuinfo_x86`:**
+
+```
+x86_vendor_id   @ 0x88   found by string search, not arithmetic
+x86_model_id    @ 0x98   immediately after
+x86_capability  @ 0x28
+```
+
+Capability at 0x28 is worth checking twice: `0x88 - 0x60 = 0x28`, and 0x60 is exactly
+(NCAPINTS 22 + NBUGINTS 2) × 4 — the array ends flush against the vendor string with no
+padding. Word 4 there reads `0xfef83203`, bit 31 set, which is `X86_FEATURE_HYPERVISOR`.
+Two other candidate offsets also had bit 31 set, which is why the struct arithmetic had to
+confirm the answer rather than the value being trusted on appearance.
+
+## The architecture question
+
+The stock kernel reports `aarch64`, and the first version of this module kept that. It was
+backwards. Every userspace binary on the image is EM_X86_64:
+
+```
+/system/bin/sh            e_machine=3e00   x86_64
+/system/bin/toybox        e_machine=3e00   x86_64
+/system/bin/app_process64 e_machine=3e00   x86_64
+/system/bin/linker64      e_machine=3e00   x86_64
+/system/lib64/libc.so     e_machine=3e00   x86_64
+```
+
+One read of an ELF header beats every faked value in this file. `uname -m` now reports
+`x86_64`, `vendor_id` says `GenuineIntel`, `cpu family 6 / model 156`, and `model name`
+names a mobile-class part — so cpuinfo, uname and the binaries all agree.
+
+## Hiding the module itself
+
+`/proc/modules` walks the global `modules` list via `list_entry()`, and `/sys/module/<name>`
+is created by `mod_sysfs_setup`. There is no "hidden" flag to set, so the module unlinks
+from both. `mod_sysfs_teardown` is not exported and is found through kallsyms.
+
+**The cost, stated rather than discovered later:** after `list_del` the module cannot be
+unloaded from userspace and `module_put` bookkeeping no longer sees it. It stays resident
+until reboot. That is why the unlink happens last, after everything else has succeeded.
 
 ## Building it
 
-The module must be built against the exact source that matches `uname -r`. That turned out
-to be AOSP branch `deprecated/android14-6.1-2024-08`, whose `Makefile` says `SUBLEVEL = 90`
-(commit `ab81bbc79`):
+The module must match `uname -r` exactly — AOSP branch `deprecated/android14-6.1-2024-08`,
+whose Makefile says `SUBLEVEL = 90` (commit `ab81bbc79`):
 
 ```bash
 git clone --depth 1 --branch deprecated/android14-6.1-2024-08 \
     https://android.googlesource.com/kernel/common android-6.1.90
 ```
 
-Building on Windows needs MSYS2 plus several generated headers the kernel normally produces
-for itself. `build.sh` in this directory is the working recipe; the steps that matter:
+On Windows that needs MSYS2 plus several headers the kernel normally generates for itself.
+`build.sh` is the working recipe; the obstacles worth knowing:
 
 | obstacle | resolution |
 |---|---|
-| `fixdep` aborts with "read: No error" (binary I/O on a Windows path) | replaced with a no-op stub — **which must not write to `argv[2]`**, because that is the target `.o`. The first version did, truncating every object to zero bytes and making modpost report `Invalid argument` on an empty ELF. |
-| `objtool` needs libelf, unavailable for mingw | replaced with a stub; it only validates, it does not change code |
-| `check-local-export` kills itself when `$NM`/`$AWK` arrive empty | replaced with a stub; this module exports no symbols |
-| `CC_VERSION_TEXT` contains parentheses, which MSYS `sh` reads as syntax | the config line is rewritten to a plain value; the check only warns |
-| `M=` rejects `F:/path` ("cannot contain ':'") and mangles `/f/path` | the module lives at `khide_build/` inside the tree, so `M=` is relative |
-| headers normally generated by the build (`autoconf.h`, `bounds.h`, `timeconst.h`, `unistd_64.h`, arch `asm/` wrappers, `module.lds`) | generated from `.config` and the syscall tables |
-| `file2alias.c` needs `devicetable-offsets.h`, produced by a compile-and-parse step | replaced with a stub; this module declares no device tables |
+| `fixdep` aborts with "read: No error" (binary I/O on a Windows path) | no-op stub — **which must not write to `argv[2]`**, because that is the target `.o`. The first version did, truncating every object to zero bytes and making modpost report `Invalid argument` on an empty ELF. |
+| `objtool` needs libelf, unavailable for mingw | stub; it only validates |
+| `check-local-export` kills itself when `$NM`/`$AWK` arrive empty | stub; this module exports nothing |
+| `CC_VERSION_TEXT` contains parentheses, which MSYS `sh` reads as syntax | rewritten to a plain value |
+| `M=` rejects `F:/path` ("cannot contain ':'") and mangles `/f/path` | module lives at `khide_build/`, so `M=` is relative |
+| generated headers (`autoconf.h`, `bounds.h`, `timeconst.h`, `unistd_64.h`, asm wrappers, `module.lds`) | generated from `.config` and the syscall tables |
+| `file2alias.c` needs `devicetable-offsets.h` | stub; this module declares no device tables |
 
-`-mcmodel=large` is not required for a properly-built module (the `-mcmodel=kernel` in the
-kernel's own flags is correct here); the earlier need for it came from hand-assembling ELF
-without the kernel's build flags.
-
-## What the loader checks
-
-From `kernel/module/main.c` and `arch/x86/kernel/module.c`:
-
-```c
-if (mod->init != NULL)                 /* 2506: the only gate */
-        ret = do_one_initcall(mod->init);
-
-case R_X86_64_64:                      /* 166: target must start at zero */
-        if (*(u64 *)loc != 0)
-                goto invalid_relocation;
-```
-
-`module_init()` expands to a `init_module` alias plus
-`___ADDRESSABLE(init_module, __initdata)`, which becomes
-`__UNIQUE_ID___addressable_init_module<line>` in `.init.data`. A hand-built module that
-named it `__addressable_init_module1` — dropping the `__UNIQUE_ID___` prefix — was
-referencing a symbol the loader never looks at.
+`scripts/service.sh` must have **LF line endings** — Android's `sh` fails on `\r` with
+`syntax error: unexpected 'do'`, and the module silently does nothing at boot.
 
 ## Result
 
 ```
-before: 6.1.90-perf+
-after : 6.1.75-android14-11-g4d9e0d1b2c3f|aarch64
+uname -r : 6.1.75-android14-11-g4d9e0d1b2c3f
+uname -m : x86_64
+cpuinfo  : GenuineIntel / Intel(R) Celeron(R) N5105 @ 2.00GHz
+flags    : no hypervisor, no vmmcall
+dmi      : Samsung Electronics Co., Ltd. / SM-S9210
+clocksrc : arch_sys_counter
+lsmod    : 0   (the module is not listed)
+mounts   : 0   (nothing is mounted over anything)
 ```
 
-Verified across every path a check would read: `uname -r`, `uname -m`, `uname -a`,
-`/proc/sys/kernel/osrelease`, `/proc/version`, and a freshly spawned shell. `rmmod` restores
-all of them.
-
-The module also loads from the KernelSU module's `service.sh`, so it survives a reboot.
+Verified after a reboot, so the KernelSU module's `service.sh` loads it at boot.
+`rmmod` restores the originals — but only in the build that skips the self-hiding step, as
+noted above.

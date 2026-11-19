@@ -68,43 +68,16 @@ else
 fi
 
 # --- stop KernelSU from unmounting the overrides ---------------------------
-# `kernel_umount` (on by default) unmounts module mounts when it decides they are
-# not needed — which silently wiped every bind below a few minutes after boot.
-# It must be turned off BEFORE the mounts are made, or they vanish anyway.
-"$KSU_BIN/ksud" feature set kernel_umount 0 2>/dev/null && log "kernel_umount off"
-
-# --- bind-mount the files a professional check opens -------------------------
-mkdir -p "$STAGE/dmi" 2>/dev/null
-
-bind() { # bind <staged-name> <target> <content>
-  printf '%s' "$3" > "$STAGE/$1" 2>/dev/null || return 1
-  umount "$2" 2>/dev/null
-  mount --bind "$STAGE/$1" "$2" 2>/dev/null || return 1
-  return 0
-}
-
-CPUINFO=$(cat "$MODDIR/cpuinfo" 2>/dev/null)
-[ -n "$CPUINFO" ] && bind cpuinfo /proc/cpuinfo "$CPUINFO" && log "cpuinfo covered"
-
-KALLSYMS=$(cat "$MODDIR/kallsyms" 2>/dev/null)
-[ -n "$KALLSYMS" ] && bind kallsyms /proc/kallsyms "$KALLSYMS" && log "kallsyms covered"
-
-bind cs_cur  /sys/devices/system/clocksource/clocksource0/current_clocksource "arch_sys_counter" \
-  && log "clocksource current covered"
-# The available list names the hypervisor too — kvm-clock sitting in it is a tell
-# even when the active one is clean.
-bind cs_avail /sys/devices/system/clocksource/clocksource0/available_clocksource "arch_sys_counter tsc hpet acpi_pm" \
-  && log "clocksource available covered"
-
-bind osrelease /proc/sys/kernel/osrelease "$(cat "$MODDIR/osrelease" 2>/dev/null)" \
-  && log "osrelease covered"
-
-for kv in sys_vendor product_name product_version board_vendor board_name \
-          bios_vendor bios_version chassis_vendor; do
-  val=$(grep "^$kv=" "$MODDIR/dmi.prop" 2>/dev/null | cut -d= -f2-)
-  [ -n "$val" ] && bind "dmi/$kv" "/sys/class/dmi/id/$kv" "$val"
-done
-log "dmi covered"
+# --- the previous bind-mount layer is gone ----------------------------------
+# Earlier versions covered /proc/cpuinfo, /proc/kallsyms, the clocksource files and the
+# DMI attributes with `mount --bind`. That worked, but every one of those mounts shows up
+# in /proc/self/mounts, which any process can read: on real hardware /proc/cpuinfo comes
+# from procfs and /sys/class/dmi/id/* from sysfs, so an ext4 partition as the source is a
+# bigger tell than the value it was hiding.
+#
+# khide_hook.ko now sets all of it in kernel data instead, so nothing is mounted and
+# /proc/mounts stays clean. The staged files and the bind helper are removed rather than
+# left dormant — a mount that fires on some future boot would reintroduce the tell.
 
 # --- hide SELinux permissive from app uids ----------------------------------
 "$KSU_BIN/ksud" feature set selinux_hide 1 2>/dev/null && log "selinux_hide on"

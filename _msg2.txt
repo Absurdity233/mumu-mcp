@@ -1,0 +1,87 @@
+feat(kmod): hide the whole emulator surface in kernel data, with zero bind mounts
+
+The bind-mount layer is gone. Every override now happens where the kernel keeps the value,
+so `/proc/self/mounts` stays clean — and that mattered more than any individual value.
+
+## Why bind mounts had to go
+
+The previous version covered /proc/cpuinfo, /proc/kallsyms, the clocksource files and the
+eight DMI attributes with `mount --bind`. The values were right and it still gave itself
+away, because the mount table is world-readable:
+
+    /dev/block/sdc3 /proc/cpuinfo ext4 rw,seclabel,noatime 0 0
+    /dev/block/sdc3 /sys/class/dmi/id/sys_vendor ext4 rw,seclabel,noatime 0 0
+
+On real hardware those paths come from procfs and sysfs. An ext4 partition as the source is
+a stronger signal than the value being hidden. This was never checked before — the scan had
+no mount-table probe at all, so 15 override lines sat there unnoticed.
+
+## What the module does now
+
+    uname -r/-m   init_uts_ns.name           exported symbol
+    clocksource   curr_clocksource->name     kallsyms
+    DMI identity  dmi_ident[]                kallsyms
+    cpuinfo       per-cpu cpuinfo_x86        kallsyms + per_cpu_ptr
+    itself        global modules list + sysfs  list_del + mod_sysfs_teardown
+
+kallsyms_lookup_name is one of the 12012 symbols this kernel exports, so no address is
+baked in and a KASLR reshuffle at boot changes nothing.
+
+## The architecture correction
+
+`uname -m` used to report aarch64 to match the stock kernel. That was backwards. Every
+userspace binary on the image is EM_X86_64 — /system/bin/sh, toybox, app_process64,
+linker64, libc.so and libm.so all report e_machine 0x3e — so one read of an ELF header beat
+every faked value in the codebase. It now reports x86_64, and cpuinfo was made to agree:
+GenuineIntel, family 6, model 156, "Intel(R) Celeron(R) N5105".
+
+## Measured offsets
+
+Two wrong guesses each wedged the guest, so nothing is written until the offset is read out
+of live memory first.
+
+struct clocksource: `name` is at 0x30, not 0. The struct begins with the `read` function
+pointer; writing a string at offset 0 made the kernel call into text while taking a
+timestamp and the guest stopped answering entirely.
+
+struct cpuinfo_x86: vendor_id 0x88 (found by string search), model_id 0x98, capability
+0x28. The last is 0x88 - 0x60, where 0x60 is exactly (NCAPINTS 22 + NBUGINTS 2) * 4 — the
+array ends flush against the vendor string with no padding. Word 4 there reads 0xfef83203,
+bit 31 set: X86_FEATURE_HYPERVISOR. Two other candidate offsets also had bit 31 set, which
+is why the struct arithmetic had to confirm it rather than the value being trusted.
+
+## Hiding the module itself
+
+There is no "hidden" flag. /proc/modules walks the global modules list via list_entry(), so
+the module unlinks from it and calls mod_sysfs_teardown. The cost is real: after the unlink
+it cannot be unloaded from userspace and stays resident until reboot — which is why that
+step runs last. mumu_kmod_unload() says so instead of reporting a path error.
+
+## Also fixed
+
+- The scan gained a `mounts` probe and it immediately reported 5 overrides. Without it the
+  zero-mount result would have been unverifiable.
+- `vendor_markers` counted a random 48-char property name that happened to end in "nemu".
+  Now the marker must match a whole dot/underscore-separated segment.
+- `root_dirs` and `adbd_privilege` graded against a root shell. /data/adb is mode 700
+  root:root and adbd's uid is not readable by an app, so both now judge what a detector
+  can actually see. Same result, honest reason.
+- `service.sh` had CRLF line endings. Android's sh fails on \r with "syntax error:
+  unexpected 'do'", so the module silently did nothing on reboot while working fine when
+  run by hand. There is now a test for it.
+
+## Result
+
+    uname -r : 6.1.75-android14-11-g4d9e0d1b2c3f
+    uname -m : x86_64
+    cpuinfo  : GenuineIntel / Intel(R) Celeron(R) N5105 @ 2.00GHz
+    flags    : no hypervisor, no vmmcall
+    dmi      : Samsung Electronics Co., Ltd. / SM-S9210
+    clocksrc : arch_sys_counter
+    lsmod    : 0     (the module is not listed)
+    mounts   : 0     (nothing is mounted over anything)
+
+Scan: 14/14 clean, verdict "clean", unfixable 0. Verified after a reboot, so the KernelSU
+module loads it at boot.
+
+110 tools, 233 tests (214 hermetic + 19 live), ruff clean.

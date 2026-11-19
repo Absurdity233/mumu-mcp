@@ -34,9 +34,15 @@ KO_LOCAL = Path(__file__).resolve().parent.parent / "native" / "km" / "khide_hoo
 KO_DEVICE = "/data/local/tmp/khide_hook.ko"
 MODULE_NAME = "khide_hook"
 
-# What the module installs; must agree with fakeprofile.py and the module's own source.
+# What the module installs; must agree with the module's own source.
+#
+# `machine` is x86_64 rather than aarch64 on purpose. Every userspace binary on this image
+# is EM_X86_64 (/system/bin/sh, toybox, app_process64, linker64, libc.so all report
+# e_machine 0x3e), so claiming aarch64 only contradicted every binary on the system — one
+# read of an ELF header was a stronger signal than any value being hidden. Reporting what
+# the userspace actually is makes uname and the binaries agree.
 EXPECT_RELEASE = "6.1.75-android14-11-g4d9e0d1b2c3f"
-EXPECT_MACHINE = "aarch64"
+EXPECT_MACHINE = "x86_64"
 
 
 class KernelUname:
@@ -52,17 +58,27 @@ class KernelUname:
                               detail={"fix": "mumu_root_adb(True)"})
 
     def status(self, vmindex: int = 0) -> dict[str, Any]:
-        """Whether the module is loaded, and what uname reports right now."""
-        loaded = self.adb.shell(
+        """Whether the module is in effect, and what uname reports right now.
+
+        `lsmod` cannot answer this on its own: the module unlinks itself from the global
+        modules list, so a *working* module is invisible there. The release string is the
+        reliable signal — it only reads as a handset when the module's init actually ran.
+        """
+        listed = self.adb.shell(
             vmindex, f"lsmod 2>/dev/null | grep -c '^{MODULE_NAME} '").strip()
         release = self.adb.shell(vmindex, "uname -r").strip()
         machine = self.adb.shell(vmindex, "uname -m").strip()
+
+        spoofed = release == EXPECT_RELEASE and machine == EXPECT_MACHINE
         return {
-            "loaded": loaded == "1",
+            # "loaded" means "in effect", because that is the only thing observable once
+            # the module has hidden itself.
+            "loaded": spoofed,
+            "listed_in_lsmod": listed == "1",
             "module": MODULE_NAME,
             "release": release,
             "machine": machine,
-            "spoofed": release == EXPECT_RELEASE and machine == EXPECT_MACHINE,
+            "spoofed": spoofed,
             "expected": {"release": EXPECT_RELEASE, "machine": EXPECT_MACHINE},
         }
 
@@ -87,6 +103,21 @@ class KernelUname:
 
         before = self.status(vmindex)
 
+        # Already in effect: a second insmod would fail (the module is resident and
+        # deliberately unlisted), and there is nothing to redo. Only a rebuild needs the
+        # module unloaded first.
+        if before["spoofed"] and not rebuild:
+            return {
+                "loaded": True,
+                "via": "already loaded",
+                "output": "",
+                "before": {"release": before["release"], "machine": before["machine"]},
+                "after": {"release": before["release"], "machine": before["machine"]},
+                "verified": True,
+                "note": "already in effect; the module hides itself so lsmod will not "
+                        "list it. Reboot to unload.",
+            }
+
         # Unload a previous instance so a rebuild takes effect.
         self.adb.shell(vmindex, f"rmmod {MODULE_NAME} 2>/dev/null")
 
@@ -100,7 +131,7 @@ class KernelUname:
 
         after = self.status(vmindex)
         return {
-            "loaded": after["loaded"],
+            "loaded": after["spoofed"],
             "via": used,
             "output": out,
             "before": {"release": before["release"], "machine": before["machine"]},
@@ -110,12 +141,23 @@ class KernelUname:
         }
 
     def unload(self, vmindex: int = 0) -> dict[str, Any]:
-        """Unload the module; `uname` returns to the real kernel identity."""
+        """Unload the module; `uname` returns to the real kernel identity.
+
+        This succeeds only against a build that skips the self-hiding step. The shipped
+        module unlinks itself from the module list and from sysfs, so `rmmod` cannot find
+        it — a reboot is the only way back. That is the trade for not appearing in
+        `/proc/modules`, and the return value says so rather than pretending otherwise.
+        """
         out = self.adb.shell(vmindex, f"rmmod {MODULE_NAME} 2>&1").strip()
         after = self.status(vmindex)
+        restored = not after["spoofed"]
         return {
-            "unloaded": not after["loaded"],
+            "unloaded": restored,
             "output": out,
+            # `rmmod` on a self-hidden module reports "No such file or directory", which
+            # reads like a path mistake; say what actually happened.
+            "reason": "" if restored else (
+                "the module unlinks itself so rmmod cannot find it; reboot to restore"),
             "release": after["release"],
-            "restored": after["release"] != EXPECT_RELEASE,
+            "restored": restored,
         }

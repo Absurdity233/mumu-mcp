@@ -89,7 +89,7 @@ def test_status_reports_loaded_and_spoofed():
         if cmd == "uname -r":
             return EXPECT_RELEASE + "\n"
         if cmd == "uname -m":
-            return "aarch64\n"
+            return "x86_64\n"
         return ""
 
     k, _ = _kmod(shell)
@@ -105,7 +105,7 @@ def test_status_reports_unspoofed_when_release_is_real():
         if cmd == "uname -r":
             return "6.1.90-perf+\n"
         if cmd == "uname -m":
-            return "aarch64\n"
+            return "x86_64\n"
         return ""
 
     k, _ = _kmod(shell)
@@ -150,7 +150,7 @@ def test_load_falls_back_to_ksud_on_unknown_symbol():
         if cmd == "uname -r":
             return (EXPECT_RELEASE if state["loaded"] else "6.1.90-perf+") + "\n"
         if cmd == "uname -m":
-            return "aarch64\n"
+            return "x86_64\n"
         if cmd.startswith("ls /data"):
             return "/data/local/tmp/khide_hook.ko\n"
         return ""
@@ -166,7 +166,7 @@ def test_load_reports_before_and_after():
         if cmd == "uname -r":
             return EXPECT_RELEASE + "\n"
         if cmd == "uname -m":
-            return "aarch64\n"
+            return "x86_64\n"
         if "lsmod" in cmd:
             return "1\n"
         if cmd.startswith("ls /data"):
@@ -194,7 +194,7 @@ def test_unload_reports_restoration():
         if cmd == "uname -r":
             return (EXPECT_RELEASE if state["loaded"] else "6.1.90-perf+") + "\n"
         if cmd == "uname -m":
-            return "aarch64\n"
+            return "x86_64\n"
         return ""
 
     k, _ = _kmod(shell)
@@ -212,19 +212,40 @@ def test_module_name_matches_the_binary():
 # ---------------------------------------------------------------------------
 @LIVE
 def test_live_kernel_module_changes_uname_systemwide():
-    """The claim that matters: after loading, a plain `uname` reports the fake kernel."""
-    from mumu_mcp.server import mumu_kmod_load, mumu_kmod_status, mumu_kmod_unload
+    """The claim that matters: after loading, a plain `uname` reports the fake kernel.
 
-    try:
-        loaded = mumu_kmod_load.__wrapped__(0, rebuild=True)
-        assert loaded["verified"] is True, loaded
+    The module hides itself from `/proc/modules` and `/sys/module`, so it cannot be
+    unloaded afterwards — `rmmod` will not find it. This test therefore does not try to
+    unload; it checks the observable effect and leaves the module resident.
+    """
+    from mumu_mcp.server import mumu_kmod_load, mumu_kmod_status
 
-        status = mumu_kmod_status.__wrapped__(0)
-        assert status["spoofed"] is True
-        assert status["release"] == EXPECT_RELEASE
-        assert status["machine"] == EXPECT_MACHINE
-    finally:
-        mumu_kmod_unload.__wrapped__(0)
+    loaded = mumu_kmod_load.__wrapped__(0, rebuild=True)
+    assert loaded["loaded"] is True, loaded
 
-    after = mumu_kmod_status.__wrapped__(0)
-    assert after["spoofed"] is False, "unload must restore the real identity"
+    status = mumu_kmod_status.__wrapped__(0)
+    assert status["release"] == EXPECT_RELEASE, status
+    assert status["machine"] == EXPECT_MACHINE, status
+
+    # And it must not be listed anywhere a check looks.
+    from mumu_mcp import server
+
+    adb = server.adb()
+    assert adb.shell(0, "lsmod | grep -c khide").strip() == "0"
+    assert "No such" in adb.shell(0, "ls -d /sys/module/khide_hook 2>&1")
+
+
+@LIVE
+def test_live_no_bind_mounts_are_used():
+    """Every override must come from kernel data, not from a mounted file.
+
+    A bind mount is visible in /proc/self/mounts and its source is an ext4 partition,
+    where a real device would show procfs or sysfs.
+    """
+    from mumu_mcp import server
+
+    adb = server.adb()
+    out = adb.shell(
+        0,
+        "grep -E 'proc/cpuinfo|proc/kallsyms|clocksource0|dmi/id' /proc/mounts 2>/dev/null")
+    assert out.strip() == "", f"bind mounts still present:\n{out}"

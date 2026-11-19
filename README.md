@@ -1,7 +1,7 @@
 # mumu-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Netease MuMu Player** — the Android emulator
-used for mobile game automation and app testing. 110 tools, root, environment hiding and kernel-level uname spoofing, structured errors.
+used for mobile game automation and app testing. 110 tools, root, and a kernel module that hides the whole emulator surface, structured errors.
 
 MuMu exposes two things a program can drive: the `MuMuManager` CLI (lifecycle, settings, app
 management, a guest shell) and ADB (input, screenshots, files, logcat). This server wraps both,
@@ -421,14 +421,11 @@ leak:       root_dirs, adbd_privilege                                (2, fixable
 unfixable:  uname_r → closeable with mumu_uname_patch                (see below)
 ```
 
-### Kernel level — `uname(2)`
+### Kernel level — the whole emulator surface
 
-`uname` is the one tell neither `resetprop` nor a bind mount can reach: it reads a kernel
-struct, not a file. Verified — after covering `/proc/version`, `uname -r` still printed
-`6.1.90-perf+`.
-
-**The working fix is a kernel module that rewrites `init_uts_ns.name`** — the single struct
-every `uname` copies from. System-wide, no per-process tracer, nothing bind-mounted.
+`uname` is the one tell neither `resetprop` nor a bind mount can reach: it reads kernel
+data, not a file. **The fix is a kernel module** that rewrites that data in place, so
+nothing is mounted and `/proc/self/mounts` stays clean.
 
 ```python
 mumu_kmod_load()      # push + load, verify the effect
@@ -436,19 +433,33 @@ mumu_kmod_status()    # loaded? spoofed? what does uname say now
 mumu_kmod_unload()    # restore the real identity
 ```
 
-Measured across every path a check reads:
+What it settles:
+
+| target | before | after |
+|---|---|---|
+| `uname -r` | `6.1.90-perf+` | `6.1.75-android14-11-g4d9e0d1b2c3f` |
+| `uname -m` | `aarch64` | `x86_64` |
+| cpuinfo | `AuthenticAMD` · Ryzen 9 9955HX · `hypervisor` | `GenuineIntel` · Celeron N5105 · no VM flags |
+| DMI | `innotek GmbH` · `NiohBox` | `Samsung` · `SM-S9210` |
+| clocksource | `kvm-clock` | `arch_sys_counter` |
+| `/proc/modules` | lists the module | does not |
+| `/proc/mounts` | 15 override lines | none |
+
+#### Why bind mounts had to go
+
+The earlier version covered those files with `mount --bind`. The values were right and it
+still gave itself away:
 
 ```
-before: 6.1.90-perf+
-after : 6.1.75-android14-11-g4d9e0d1b2c3f
+/dev/block/sdc3 /proc/cpuinfo ext4 rw,seclabel,noatime 0 0
 ```
 
-`uname -r`, `uname -m`, `uname -a`, `/proc/sys/kernel/osrelease`, `/proc/version`, and a
-freshly spawned shell all agree; `rmmod` restores them. The module also loads from the
-KernelSU module's `service.sh`, so it survives a reboot.
+On real hardware `/proc/cpuinfo` comes from procfs. An ext4 partition as the mount source is
+a stronger signal than any value being hidden, and every process can read `/proc/mounts`.
 
-Why the obvious approach cannot work, stated by the 6.1.90 source itself
-(`arch/x86/entry/syscall_64.c`):
+#### Why the syscall table cannot work
+
+Stated by the 6.1.90 source itself (`arch/x86/entry/syscall_64.c`):
 
 ```c
 /*
@@ -465,19 +476,30 @@ long x64_sys_call(const struct pt_regs *regs, unsigned int nr)
 
 Dispatch is that `switch`. Writing `sys_call_table[63]` changes a table nothing reads —
 which is why a module that poisoned all 55 slots of `struct module` still loaded cleanly and
-did nothing. And `set_memory_rw`, needed to make that table writable, takes `cpa_lock` and
-flushes the TLB; calling it from module init wedged the guest hard enough that adb and the
-manager channel both stopped answering.
+did nothing. And `set_memory_rw`, needed to make the table writable, takes `cpa_lock` and
+flushes the TLB; calling it from init wedged the guest hard enough that adb and the manager
+channel both stopped answering.
 
-`init_uts_ns` sidesteps all of it: it is exported (`__ksymtab_init_uts_ns` is in kallsyms)
-and sits past `__end_rodata` in ordinary writable data, so the module references it directly
-and writes it with a plain store.
+#### The architecture correction
+
+`uname -m` used to report `aarch64`, matching the stock kernel. That was backwards — every
+userspace binary on the image is EM_X86_64 (`/system/bin/sh`, `toybox`, `app_process64`,
+`linker64`, `libc.so`), so one read of an ELF header beat every faked value. Reporting
+`x86_64` makes uname, cpuinfo and the binaries agree instead of contradicting.
+
+#### Hiding the module
+
+`/proc/modules` walks the global `modules` list; there is no "hidden" flag, so the module
+unlinks itself from that list and from sysfs. The cost is real and stated: after the unlink
+it cannot be unloaded from userspace and stays resident until reboot — which is why that
+step runs last.
 
 Building it is the hard part — the module must match `uname -r` exactly
 (`deprecated/android14-6.1-2024-08`, commit `ab81bbc79`), and on Windows the kernel's own
-build plumbing needs several replacements. `native/km/README.md` records every step and the
-bug that cost the most time: a `fixdep` stub that wrote to `argv[2]`, truncating every
-object file to zero bytes.
+build plumbing needs several replacements. `native/km/README.md` records every step, the
+measured struct offsets (writing at the wrong one wedged the guest twice), and the bug that
+cost the most time: a `fixdep` stub that wrote to `argv[2]`, truncating every object file to
+zero bytes.
 
 ### Per-process tracer — `uname(2)` without a module
 
@@ -576,7 +598,7 @@ And four interface decisions aimed at the caller being a model:
 
 ```bash
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest -q                       # hermetic: 215 tests
+.venv\Scripts\python -m pytest -q                       # hermetic: 214 tests
 $env:MUMU_LIVE="1"; .venv\Scripts\python -m pytest -q   # + live emulator: 233
 .venv\Scripts\ruff check mumu_mcp tests
 ```
