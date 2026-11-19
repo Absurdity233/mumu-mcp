@@ -12,3 +12,6 @@ _smoke.py
 # scratch scripts used while probing the emulator
 _t_*.py
 _tmp_*
+
+# commit-message scratch files
+_msg*.txt
