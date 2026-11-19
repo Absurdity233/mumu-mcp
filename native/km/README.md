@@ -246,10 +246,17 @@ kernel-side node creation happens again each time.
 `rmmod` restores the originals — but only in a build that skips the self-hiding step, since
 the shipped one unlinks itself from the module list.
 
-The disks also report a Samsung UFS part rather than `HARDDISK`:
+The disks report a Samsung UFS part rather than `HARDDISK`, and the vendor no longer says
+VBOX:
 
 ```
-/sys/block/sda/device/model : KLUDG4UHGC-B0E1
-/sys/block/sdb/device/model : KLUDG4UHGC-B0E1
-/sys/block/sdc/device/model : KLUDG4UHGC-B0E1
+/sys/block/sdX/device/vendor : SAMSUNG
+/sys/block/sdX/device/model  : KLUDG4UHGC-B0E1
 ```
+
+Both come from the same INQUIRY buffer, and the first attempt got it wrong in a way worth
+recording: the pointer that matched during the scan is the *field's value* — it already points
+at its own slot inside the buffer — so treating it as the buffer start shifted every write by
+that slot's offset. The result was `vendor=[VBOX]` unchanged and `model=[SAMSUNGKLUDG4UH]`:
+the vendor string landing in the model slot. The base has to be recovered by subtracting
+`8` for vendor, `16` for model, `32` for revision.

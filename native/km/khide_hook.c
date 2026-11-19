@@ -1299,7 +1299,12 @@ static void khide_fix_module_entries(void)
  * With the real `sdev` in hand, `ksize()` returns the allocation size (4096 here), and a scan
  * bounded by it cannot leave the object. The field lands at sdev+0x100 on this build.
  */
-static const char khide_disk_model[] = "KLUDG4UHGC-B0E1 ";
+/* INQUIRY layout: byte 8 vendor (8), byte 16 model (16), byte 32 revision (4).
+ * `sdev->vendor`, `sdev->model` and `sdev->rev` already point into this one buffer, so
+ * rewriting the buffer fixes all three at once — no re-pointing needed. */
+static const char khide_disk_vendor[] = "SAMSUNG ";
+static const char khide_disk_model[]  = "KLUDG4UHGC-B0E1 ";
+static const char khide_disk_rev[]    = "0300";
 
 static bool khide_kaddr(const void *p)
 {
@@ -1307,15 +1312,22 @@ static bool khide_kaddr(const void *p)
 	       (unsigned long)p < 0xffffffff00000000UL;
 }
 
-static bool khide_is_harddisk(const void *p)
+static bool khide_starts_with(const void *p, const char *want, size_t n)
 {
-	u64 a, b;
-
 	if (!khide_kaddr(p))
 		return false;
-	memcpy(&a, p, sizeof(a));
-	memcpy(&b, "HARDDISK", sizeof(b));
-	return a == b;
+	return memcmp(p, want, n) == 0;
+}
+
+/* The three INQUIRY strings sit at fixed offsets inside the device buffer:
+ *   vendor @ +8 (8 bytes), model @ +16 (16), revision @ +32 (4)
+ * Rewriting them in place is enough because `sdev->vendor`, `sdev->model` and `sdev->rev`
+ * are pointers into that same buffer, and it is kmalloc memory — no page attribute change. */
+static void khide_fix_inquiry(char *inq)
+{
+	memcpy(inq + 8,  khide_disk_vendor, 8);
+	memcpy(inq + 16, khide_disk_model, 16);
+	memcpy(inq + 32, khide_disk_rev, 4);
 }
 
 static unsigned int khide_disks_fixed;
@@ -1359,15 +1371,20 @@ static void khide_fix_scsi_model(void)
 			continue;
 		}
 
-		/* Bounded by the real allocation: `off + 8 <= size` is what keeps every
-		 * read inside the object, which is the property the earlier scans lacked. */
+		/* Bounded by the real allocation: `off + 8 <= size` keeps every read inside
+		 * the object, which is the property the earlier scans lacked.
+		 *
+		 * Both the model and the vendor are matched, so a device that already had its
+		 * model rewritten still gets its vendor fixed — `vendor=VBOX` is the more
+		 * direct giveaway of the two. */
 		for (off = 0; off + sizeof(void *) <= size; off += sizeof(void *)) {
 			void *field = *(void **)((char *)sdev + off);
 
-			if (!khide_is_harddisk(field))
+			if (!khide_starts_with(field, "HARDDISK", 8) &&
+			    !khide_starts_with(field, "VBOX", 4))
 				continue;
 
-			memcpy(field, khide_disk_model, sizeof(khide_disk_model) - 1);
+			khide_fix_inquiry((char *)field);
 			khide_disks_fixed++;
 			break;
 		}
