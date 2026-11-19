@@ -102,4 +102,39 @@ fi
 setprop ctl.stop adbd_root 2>/dev/null
 log "adbd stage done"
 
+# --- delete vendor properties a second time ----------------------------------
+# The stage above runs as soon as boot_completed flips, and MuMu's own services keep
+# writing `nemud.*` keys for a while after that — the emulator sets its input, gamepad and
+# player properties while its launcher is still finishing. Deleting once is therefore not
+# enough: three `nemud.input.gamepad.*` keys reappeared after the first pass and were only
+# caught by scanning again later.
+#
+# A second sweep after a delay catches them. The keys are deleted rather than blanked,
+# because a key that exists with an empty value still shows up in `getprop` and is itself
+# a marker.
+sleep 20
+swept=0
+for key in $(getprop | grep -oE '^\[[^]]*(nemu|mumu|qemu|goldfish|vbox|virtualbox|vmware|haxm|whpx)[^]]*\]' | tr -d '[]'); do
+  "$RESETPROP" -d "$key" 2>/dev/null && swept=$((swept + 1))
+done
+log "late vendor properties deleted: $swept"
+
+
+# --- make /dev/kgsl-3d0 ------------------------------------------------------
+# khide_hook.ko registers a character-device major named "kgsl-3d0" (alloc_chrdev_region
+# + cdev_add) but does not create the node: building a dentry from inside a module means
+# reaching into struct nameidata, whose layout is internal. mknod from userspace produces
+# the same S_IFCHR entry a real driver's devtmpfs node would.
+#
+# The major is read back from /proc/devices rather than assumed, because it is allocated
+# dynamically and changes if another driver takes the slot first.
+KGSL_MAJOR=$(awk '$2 == "kgsl-3d0" { print $1 }' /proc/devices 2>/dev/null)
+if [ -n "$KGSL_MAJOR" ]; then
+  rm -f /dev/kgsl-3d0 /dev/kgsl-2d0
+  mknod /dev/kgsl-3d0 c "$KGSL_MAJOR" 0 2>/dev/null && log "kgsl-3d0 node created (major $KGSL_MAJOR)"
+  mknod /dev/kgsl-2d0 c "$KGSL_MAJOR" 1 2>/dev/null
+  chmod 0666 /dev/kgsl-3d0 /dev/kgsl-2d0 2>/dev/null
+else
+  log "kgsl major not registered; node skipped"
+fi
 log "=== mumu-stealth done ==="
